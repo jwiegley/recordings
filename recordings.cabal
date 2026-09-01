@@ -1,0 +1,84 @@
+cabal-version:      3.0
+name:               recordings
+version:            1.0.0
+synopsis:           Watch, transcribe, clean, and archive voice recordings
+description:
+  A long-running daemon that watches a directory tree for audio
+  recordings, transcribes each through an OpenAI-compatible speech
+  endpoint (or a local command), cleans the transcript with an LLM and a
+  prompt file, publishes the result as a .txt file, and archives the
+  audio.  Ordering and atomic renames make it crash-safe without any
+  transaction machinery.
+
+license:            BSD-3-Clause
+license-file:       LICENSE
+author:             John Wiegley
+maintainer:         johnw@newartisans.com
+category:           System
+build-type:         Simple
+extra-doc-files:    README.md
+tested-with:        GHC ==9.8 || ==9.10
+
+source-repository head
+  type:     git
+  location: https://github.com/jwiegley/recordings
+
+common warnings
+  ghc-options:
+    -Wall -Wcompat -Widentities -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wredundant-constraints
+
+library
+  import:           warnings
+  hs-source-dirs:   src
+  exposed-modules:  Recordings
+  default-language: GHC2021
+  build-depends:
+    , aeson
+    , base                  >=4.16 && <5
+    , bytestring
+    , containers
+    , crypton-connection
+    , crypton-x509-store
+    , directory
+    , filepath
+    , http-client
+    , http-client-tls
+    , http-types
+    , optparse-applicative
+    , process
+    , text
+    , time
+    , tls
+    , unix
+
+executable recordings
+  import:           warnings
+  hs-source-dirs:   app
+  main-is:          Main.hs
+  default-language: GHC2021
+  ghc-options:      -threaded
+  build-depends:
+    , base
+    , optparse-applicative
+    , recordings
+
+test-suite recordings-test
+  import:           warnings
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Main.hs
+  default-language: GHC2021
+  ghc-options:      -threaded
+  build-depends:
+    , aeson
+    , base
+    , bytestring
+    , containers
+    , directory
+    , filepath
+    , recordings
+    , sydtest
+    , temporary
+    , text
+    , time
