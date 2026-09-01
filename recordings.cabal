@@ -42,6 +42,7 @@ library
     , crypton-x509-store
     , directory
     , filepath
+    , fsnotify
     , http-client
     , http-client-tls
     , http-types

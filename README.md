@@ -27,7 +27,9 @@ recordings ~/Recordings \
   --llm-model GLM-5.3-Flash-oQ4e
 ```
 
-- The watch tree is polled (default every 30 s, `--poll`); a file is
+- Native filesystem events (FSEvents on macOS, inotify on Linux) start a
+  sweep the moment the watch tree changes, with an interval poll (default
+  30 s, `--poll`) as the fallback for anything events miss; a file is
   processed only once its size and mtime are stable across two scans, so
   half-synced uploads are left alone. `--once` runs a single sweep.
 - Audio is first converted to 16 kHz mono WAV (the model's native input)

@@ -49,6 +49,7 @@ module Recordings (
 where
 
 import Control.Concurrent (threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Exception (
   AsyncException,
   IOException,
@@ -89,11 +90,13 @@ import Options.Applicative
 import System.Directory
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure)
+import System.FSNotify qualified as FSNotify
 import System.FilePath
 import System.IO
 import System.Posix.IO (closeFd, handleToFd)
 import System.Posix.Unistd (fileSynchronise)
 import System.Process (readProcessWithExitCode)
+import System.Timeout (timeout)
 
 -- * Options
 
@@ -532,6 +535,13 @@ scanAudio root = do
             then walk p
             else pure [p | isAudioName e]
 
+-- | Like 'try', but let asynchronous exceptions propagate.
+trySync :: IO a -> IO (Either SomeException a)
+trySync act =
+  try act >>= \case
+    Left e | Just (ae :: AsyncException) <- fromException e -> throwIO ae
+    r -> pure r
+
 stepFile :: Env -> Map FilePath Identity -> Fails -> FilePath -> IO Fails
 stepFile env scan fails audio = case Map.lookup audio scan of
   Nothing -> pure fails
@@ -541,10 +551,9 @@ stepFile env scan fails audio = case Map.lookup audio scan of
     , n >= maxAttempts ->
         pure fails
     | otherwise ->
-        try (processFile env audio ident) >>= \case
+        trySync (processFile env audio ident) >>= \case
           Right () -> pure (Map.delete audio fails)
-          Left (e :: SomeException) -> do
-            forM_ (fromException e) $ \(ae :: AsyncException) -> throwIO ae
+          Left e -> do
             let n' = case Map.lookup audio fails of
                   Just (i, n) | i == ident -> n + 1
                   _ -> 1
@@ -597,12 +606,26 @@ run opts0 = do
   let opts = opts0{optWatchDir = watch, optOutputDir = output, optArchiveDir = archive}
       env = Env{envOpts = opts, envStateDir = stateDir, envAsrManager = asrMgr, envLlmManager = llmMgr}
   logMsg ("watching " <> watch <> " -> " <> output <> " (archive " <> archive <> ")")
-  let loop fails = do
-        fails' <-
-          sweep env fails `catch` \(e :: IOException) -> do
-            logMsg ("ERROR sweep failed: " <> show e)
-            pure fails
-        unless (optOnce opts) $ do
-          threadDelay (max 1 (optPollSecs opts) * 1000000)
-          loop fails'
-  loop Map.empty
+  kick <- newEmptyMVar
+  let oneSweep fails =
+        sweep env fails `catch` \(e :: IOException) -> do
+          logMsg ("ERROR sweep failed: " <> show e)
+          pure fails
+      loop fails = do
+        fails' <- oneSweep fails
+        -- Sleep until the fallback poll expires or an event kicks first.
+        _ <- timeout (max 1 (optPollSecs opts) * 1000000) (takeMVar kick)
+        loop fails'
+  if optOnce opts
+    then void (oneSweep Map.empty)
+    else FSNotify.withManager $ \wm -> do
+      -- Native filesystem events (FSEvents on macOS, inotify on Linux)
+      -- start a sweep the moment the tree changes; the interval poll
+      -- remains the fallback for anything events miss.  Our own writes
+      -- under the tree also kick, costing one cheap no-op sweep.
+      watching <- trySync (FSNotify.watchTree wm watch (const True) (\_ -> void (tryPutMVar kick ())))
+      case watching of
+        Left e ->
+          logMsg ("WARN filesystem events unavailable, polling only: " <> excerptEnds 200 (unwords (words (show e))))
+        Right _stop -> logMsg "filesystem events active"
+      loop Map.empty
