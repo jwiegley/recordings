@@ -40,7 +40,7 @@ Replace --asr-command mlx-speech with --asr-url https://hera.lan:8443/v1 --asr-m
 :LABELS:   []
 :ISSUE_TYPE: chore
 :CREATED:  [2026-09-01 Tue 00:40]
-:MODIFIED: [2026-09-01 Tue 09:26]
+:MODIFIED: [2026-09-01 Tue 11:57]
 :CREATED_BY: johnw
 :SOURCE_REPO: .
 :ORIGINAL_SIZE: 0
@@ -70,13 +70,13 @@ omlx 0.6.4 /v1/audio/transcriptions returns multilingual garbage for cohere-tran
 :LABELS:   []
 :ISSUE_TYPE: question
 :CREATED:  [2026-09-01 Tue 00:40]
-:MODIFIED: [2026-09-01 Tue 00:40]
+:MODIFIED: [2026-09-01 Tue 12:01]
 :CREATED_BY: johnw
 :SOURCE_REPO: .
 :ORIGINAL_SIZE: 0
 :END:
 
-The old flatten-recordings called dispatch-agent-note enqueue/drain after publishing each transcript. Not carried into the rewrite (not in the six requirements). If still wanted, a post-publish hook command flag would be the minimal addition.
+The old flatten-recordings called dispatch-agent-note enqueue/drain after publishing each transcript. Not carried into the rewrite (not in the six requirements). If still wanted, a post-publish hook command flag would be the minimal addition. NOTE 2026-09-01: dispatch-agent-note itself shells out to the transcribe script (AGENT_NOTE_TRANSCRIBE default, ~/src/scripts/dispatch-agent-note:200,607) and reads ~/.config/transcribe/llm-route.json — the staged deletion of transcribe leaves it broken until this is resolved (port its LLM call or retire it).
 
 * TODO [#D] Confirm org importer handles new transcript naming
 :PROPERTIES:

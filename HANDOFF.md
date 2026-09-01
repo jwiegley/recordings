@@ -62,8 +62,28 @@ close when `nix develop` verified.
 
 ## 2. Update ~/src/nix — launchd block + recordings dependency
 
-Claim `record-3tf` first (`obr update record-3tf --status=in_progress`,
-in ~/src/recordings).
+STATUS 2026-09-01: EDITS DONE (uncommitted in ~/src/nix, staged where nix
+requires it), `record-3tf` claimed in_progress. What was changed:
+
+- `flake.nix`: added `recordings` input as
+  `git+file:///Users/johnw/src/recordings` with `flake = false` (comment
+  says to flip to github:jwiegley/recordings once the repo is pushed).
+- `overlays/30-recordings.nix` (new, git-added):
+  `recordings = final.haskellPackages.callCabal2nix "recordings" src {}`,
+  guarded on the input being present, house style.
+- `config/overlays.nix`: registered in the features list.
+- `config/launchd.nix`: old fswatch `flatten-recordings` AND the
+  15-minute `flatten-recordings-sweep` agents replaced by one daemon
+  service in its own `isHera && (pkgs ? recordings)` guard (push-tank's
+  my-scripts guard untouched); dead `recordingCaBundle` binding removed.
+- `flake.lock`: written with `--allow-dirty-locks` (git+file inputs count
+  as unlocked). Plain `nix eval` then works but warns the entry is
+  NAR-hash-checked only — fine on hera, fragile across GC/other hosts.
+  The durable fix: push the repo, flip the input URL, `nix flake lock`.
+
+REMAINING: John pushes repo + flips URL (his call — publication);
+`darwin-rebuild switch`; verify the service log shows "filesystem events
+active" and a dropped recording processes; then close `record-3tf`.
 
 a. Replace the `flatten-recordings` service in
 `~/src/nix/config/launchd.nix` with (this exact invocation is E2E-tested;
@@ -125,12 +145,13 @@ cleaned `.txt` at the top of `~/Recordings`, audio archived to
 
 ## 3. Stage (do not commit) old-script deletions in ~/src/scripts
 
-```sh
-cd ~/src/scripts && git rm flatten-recordings transcribe
-```
-
-Leave staged for John's review — he asked for staging only. Do NOT touch
-`dispatch-agent-note` (open question `record-ct9`).
+DONE 2026-09-01: staged (not committed) — `flatten-recordings`,
+`transcribe`, `test_flatten_recordings.sh`, `test_transcribe.py`.
+`dispatch-agent-note` and its test kept (open question `record-ct9`) —
+but NOTE: dispatch-agent-note shells out to `transcribe`
+(AGENT_NOTE_TRANSCRIBE default; lines ~200/607) and reads
+`~/.config/transcribe/llm-route.json`, so it is dangling once the staged
+deletion lands; recorded on `record-ct9`.
 
 ## 4. obr bookkeeping (AGENTS.md session protocol)
 
