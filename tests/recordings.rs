@@ -1,0 +1,213 @@
+use recordings::*;
+use serde_json::to_vec;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
+use tempfile::tempdir;
+
+fn some_time() -> std::time::SystemTime {
+    UNIX_EPOCH + Duration::from_secs(1_788_134_400)
+}
+
+#[test]
+fn audio_names_accept_common_extensions_case_insensitively() {
+    assert!(is_audio_name("memo.m4a"));
+    assert!(is_audio_name("MEMO.M4A"));
+    assert!(is_audio_name("take.wav"));
+}
+
+#[test]
+fn audio_names_reject_transcripts_hidden_files_and_icloud_placeholders() {
+    assert!(!is_audio_name("memo.txt"));
+    assert!(!is_audio_name(".memo.m4a"));
+    assert!(!is_audio_name("memo.m4a.icloud"));
+}
+
+#[test]
+fn ready_files_keeps_only_files_unchanged_across_both_scans() {
+    let ident1 = (100, some_time());
+    let ident2 = (200, some_time());
+    let before = BTreeMap::from([
+        (PathBuf::from("a"), ident1),
+        (PathBuf::from("b"), ident1),
+        (PathBuf::from("gone"), ident1),
+    ]);
+    let after = BTreeMap::from([
+        (PathBuf::from("a"), ident1),
+        (PathBuf::from("b"), ident2),
+        (PathBuf::from("new"), ident1),
+    ]);
+    assert_eq!(ready_files(&before, &after), [PathBuf::from("a")]);
+}
+
+#[test]
+fn encode_safe_flattens_slashes_injectively() {
+    assert_eq!(encode_safe("a/b.m4a"), "a%2Fb.m4a");
+    assert_eq!(encode_safe("50%.m4a"), "50%25.m4a");
+    assert_ne!(encode_safe("a%2Fb"), encode_safe("a/b"));
+}
+
+#[test]
+fn temp_name_binds_spool_to_path_size_and_mtime() {
+    let name = temp_name("voice/memo.m4a", &(12_345, some_time()));
+    assert!(!name.contains('/'));
+    assert!(name.contains("12345"));
+    assert_eq!(
+        Path::new(&name).extension().and_then(|x| x.to_str()),
+        Some("txt")
+    );
+}
+
+#[test]
+fn target_stems_starts_plain_then_counts_from_two() {
+    assert_eq!(
+        target_stems("memo").take(3).collect::<Vec<_>>(),
+        ["memo", "memo-2", "memo-3"]
+    );
+}
+
+#[test]
+fn inside_detects_containment_and_identity() {
+    assert!(is_inside(Path::new("/a/b"), Path::new("/a/b/c")));
+    assert!(is_inside(Path::new("/a/b"), Path::new("/a/b")));
+    assert!(!is_inside(Path::new("/a/b"), Path::new("/a/bc")));
+    assert!(!is_inside(Path::new("/a/b/c"), Path::new("/a/b")));
+}
+
+#[test]
+fn excerpt_keeps_short_messages_whole_and_both_ends_of_long_ones() {
+    assert_eq!(excerpt_ends(10, "short"), "short");
+    let long = "a".repeat(50) + "CAUSE";
+    let excerpt = excerpt_ends(10, &long);
+    assert!(excerpt.contains("CAUSE"));
+    assert!(excerpt.starts_with("aaaa"));
+}
+
+#[test]
+fn join_url_ignores_trailing_slash() {
+    assert_eq!(
+        join_url("http://h/v1", "chat/completions"),
+        "http://h/v1/chat/completions"
+    );
+    assert_eq!(
+        join_url("http://h/v1/", "chat/completions"),
+        "http://h/v1/chat/completions"
+    );
+}
+
+#[test]
+fn max_tokens_clamps_between_2048_and_32768() {
+    assert_eq!(max_tokens_for("short"), 2_048);
+    assert_eq!(max_tokens_for(&"x".repeat(100_000)), 32_768);
+    assert_eq!(max_tokens_for(&"x".repeat(10_000)), 5_000);
+}
+
+#[test]
+fn chat_request_disables_streaming_and_thinking() {
+    let body = to_vec(&chat_request_value("glm", "fix it", "raw words")).unwrap();
+    assert!(
+        body.windows(b"\"stream\":false".len())
+            .any(|x| x == b"\"stream\":false")
+    );
+    assert!(
+        body.windows(b"\"enable_thinking\":false".len())
+            .any(|x| x == b"\"enable_thinking\":false")
+    );
+}
+
+#[test]
+fn chat_request_carries_prompt_as_system_and_transcript_as_user() {
+    let body =
+        String::from_utf8(to_vec(&chat_request_value("glm", "fix it", "raw words")).unwrap())
+            .unwrap();
+    assert!(body.contains("\"system\""));
+    assert!(body.contains("\"fix it\""));
+    assert!(body.contains("\"raw words\""));
+}
+
+#[test]
+fn decode_asr_extracts_text_field() {
+    assert_eq!(
+        decode_asr_text(br#"{"text":"hello","language":"en"}"#).unwrap(),
+        "hello"
+    );
+}
+
+#[test]
+fn decode_asr_fails_on_missing_text() {
+    assert!(decode_asr_text(b"{}").is_err());
+}
+
+#[test]
+fn decode_chat_extracts_first_choice_content() {
+    assert_eq!(
+        decode_chat_text(br#"{"choices":[{"message":{"role":"assistant","content":"clean"}}]}"#)
+            .unwrap(),
+        "clean"
+    );
+}
+
+#[test]
+fn decode_chat_fails_on_empty_choices() {
+    assert!(decode_chat_text(br#"{"choices":[]}"#).is_err());
+}
+
+#[test]
+fn durable_write_is_atomic_and_leaves_no_temp_file() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("out.txt");
+    write_file_durable(&path, "content\n").unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "content\n");
+    assert!(!dir.path().join("out.txt.tmp").is_file());
+}
+
+#[test]
+fn move_path_moves_content_and_removes_source() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("a.m4a");
+    let dst = dir.path().join("b.m4a");
+    fs::write(&src, b"audio-bytes").unwrap();
+    move_path(&src, &dst).unwrap();
+    assert_eq!(fs::read(&dst).unwrap(), b"audio-bytes");
+    assert!(!src.is_file());
+}
+
+#[test]
+fn fresh_targets_uses_plain_stem_when_free() {
+    let dir = tempdir().unwrap();
+    let (txt, archive) =
+        fresh_targets(dir.path(), dir.path(), &dir.path().join("memo.m4a")).unwrap();
+    assert_eq!(txt, dir.path().join("memo.txt"));
+    assert_eq!(archive, dir.path().join("memo.m4a"));
+}
+
+#[test]
+fn fresh_targets_moves_to_two_when_either_destination_is_taken() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("memo.txt"), "occupied").unwrap();
+    let (txt, archive) =
+        fresh_targets(dir.path(), dir.path(), &dir.path().join("memo.m4a")).unwrap();
+    assert_eq!(txt, dir.path().join("memo-2.txt"));
+    assert_eq!(archive, dir.path().join("memo-2.m4a"));
+}
+
+#[test]
+fn prune_removes_empty_and_ds_store_only_subdirs_but_not_root() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("empty1/empty2")).unwrap();
+    fs::create_dir_all(dir.path().join("junk")).unwrap();
+    fs::create_dir_all(dir.path().join("keep")).unwrap();
+    fs::write(dir.path().join("junk/.DS_Store"), "").unwrap();
+    fs::write(dir.path().join("keep/file.m4a"), "x").unwrap();
+    prune_empty_dirs(dir.path());
+    assert!(!dir.path().join("empty1").is_dir());
+    assert!(!dir.path().join("junk").is_dir());
+    assert!(dir.path().join("keep").is_dir());
+    assert!(dir.path().is_dir());
+}
+
+#[test]
+fn decode_fixtures_accept_byte_json() {
+    assert_eq!(decode_asr_text(b"{\"text\":\"ok\"}").unwrap(), "ok");
+}
