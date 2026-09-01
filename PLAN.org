@@ -33,14 +33,14 @@ Replace --asr-command mlx-speech with --asr-url https://hera.lan:8443/v1 --asr-m
 ]
 #+end_src
 
-* TODO [#C] Cut over launchd service; retire transcribe and flatten-recordings scripts
+* DOING [#C] Cut over launchd service; retire transcribe and flatten-recordings scripts
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
 :ID:       record-3tf
 :LABELS:   []
 :ISSUE_TYPE: chore
 :CREATED:  [2026-09-01 Tue 00:40]
-:MODIFIED: [2026-09-01 Tue 00:40]
+:MODIFIED: [2026-09-01 Tue 09:26]
 :CREATED_BY: johnw
 :SOURCE_REPO: .
 :ORIGINAL_SIZE: 0
@@ -92,6 +92,23 @@ The old flatten-recordings called dispatch-agent-note enqueue/drain after publis
 :END:
 
 Transcripts are now published as name.txt rather than name.m4a.txt, and the org receipt-dir mechanism is gone. Verify the Org inbox importer that consumes ~/Recordings/*.txt still matches.
+
+* DONE [#C] Fix nix develop: x86_64-darwin eval throw and clobbered IOG cache
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       record-r2g
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-09-01 Tue 09:58]
+:MODIFIED: [2026-09-01 Tue 09:58]
+:CREATED_BY: johnw
+:FINISHED: [2026-09-01 Tue 09:58]
+:CLOSE_REASON: Both causes fixed and verified; devShell plan builds only project deps
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+Two stacked causes. (A) eachDefaultSystem enumerates x86_64-darwin, which nixpkgs 26.11 dropped with an import-time throw; fixed by eachSystem [aarch64-darwin x86_64-linux aarch64-linux]. (B) ~/.config/nix/nix.conf used bare 'substituters =' / 'trusted-public-keys =' lines, which replace the accumulated system config and wiped the cache.iog.io haskell.nix cache already correctly configured in /etc/nix/nix.custom.conf; fixed by switching the user file to extra-substituters/extra-trusted-public-keys (backup at ~/.config/nix/nix.conf.bak). Verified: nix config show lists cache.iog.io; devShell dry-run has zero ghc/bootstrap drvs, floating or pinned. flake.lock additionally pins haskellNix to pushme's rev a695b259 for store reuse.
 
 * DONE [#B] Trigger sweeps from native filesystem events (FSEvents/inotify)
 :PROPERTIES:
