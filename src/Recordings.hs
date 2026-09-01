@@ -102,8 +102,9 @@ data Transcriber
     model name.
     -}
     AsrHttp String String
-  | {- | Fallback: a local command (given as words) run with the audio file
-    path appended; its stdout is the transcript.
+  | {- | Fallback: a local command (given as words) run with the path of a
+    16 kHz mono WAV conversion of the recording appended; its stdout is
+    the transcript.
     -}
     AsrShell String
   deriving (Eq, Show)
@@ -143,7 +144,7 @@ optionsParser =
       <$> strOption (long "asr-url" <> metavar "URL" <> help "OpenAI-compatible base URL for transcription (e.g. https://hera.lan:8443/v1)")
       <*> strOption (long "asr-model" <> metavar "NAME" <> help "Transcription model name (e.g. cohere-transcribe-03-2026-mlx-fp16)")
         <|> AsrShell
-      <$> strOption (long "asr-command" <> metavar "CMD" <> help "Local transcription command; run with the audio path appended, stdout is the transcript")
+      <$> strOption (long "asr-command" <> metavar "CMD" <> help "Local transcription command; run with the path of a 16 kHz mono WAV conversion appended, stdout is the transcript")
 
 optionsInfo :: ParserInfo Options
 optionsInfo =
@@ -392,30 +393,36 @@ expectOk what resp = do
 
 -- * Pipeline steps
 
--- | Transcribe one audio file to raw text.
+{- | Transcribe one audio file to raw text.  The audio is first converted
+to 16 kHz mono WAV — the model's native input — with macOS-native
+afconvert, so neither the server nor a local command ever needs its own
+m4a decoder.
+-}
 runAsr :: Env -> FilePath -> IO Text
-runAsr env audio = case optTranscriber (envOpts env) of
+runAsr env audio = do
+  let wav = envStateDir env </> "convert.wav"
+  removeQuietly wav
+  (code, _, err) <-
+    readProcessWithExitCode
+      "afconvert"
+      ["-f", "WAVE", "-d", "LEI16@16000", "-c", "1", audio, wav]
+      ""
+  unless (code == ExitSuccess) $
+    ioError (userError ("afconvert failed on " <> audio <> ": " <> take 300 err))
+  transcribeWav env wav `finally` removeQuietly wav
+
+transcribeWav :: Env -> FilePath -> IO Text
+transcribeWav env wav = case optTranscriber (envOpts env) of
   AsrShell cmdline -> case words cmdline of
     [] -> ioError (userError "--asr-command is empty")
     (cmd : args) -> do
-      (code, out, err) <- readProcessWithExitCode cmd (args ++ [audio]) ""
+      (code, out, err) <- readProcessWithExitCode cmd (args ++ [wav]) ""
       case code of
         ExitSuccess -> pure (T.pack out)
         ExitFailure n ->
           ioError . userError $
             cmd <> " exited " <> show n <> ": " <> take 300 err
   AsrHttp base model -> do
-    -- Upload 16 kHz mono WAV so the server never needs its own m4a
-    -- decoder; afconvert is native on macOS.
-    let wav = envStateDir env </> "convert.wav"
-    removeQuietly wav
-    (code, _, err) <-
-      readProcessWithExitCode
-        "afconvert"
-        ["-f", "WAVE", "-d", "LEI16@16000", "-c", "1", audio, wav]
-        ""
-    unless (code == ExitSuccess) $
-      ioError (userError ("afconvert failed on " <> audio <> ": " <> take 300 err))
     req0 <- parseRequest (joinUrl base "audio/transcriptions")
     req <-
       formDataBody
@@ -428,7 +435,6 @@ runAsr env audio = case optTranscriber (envOpts env) of
       httpLbs
         (httpTimeout 3600 (authorize (optApiKey (envOpts env)) req))
         (envAsrManager env)
-        `finally` removeQuietly wav
     body <- expectOk "transcription" resp
     either (ioError . userError . ("bad transcription response: " <>)) pure $
       decodeAsrText body
