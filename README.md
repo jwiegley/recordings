@@ -1,8 +1,8 @@
 # recordings
 
-A small daemon that watches a directory tree for audio recordings and, for
-each one: transcribes it, cleans the transcript with an LLM and a prompt
-file, publishes the result as a `.txt` file, and archives the audio.
+`recordings` transcribes one or more audio files directly, or watches one
+directory tree as a daemon. It cleans each transcript with an LLM, publishes a
+`.txt` file, and optionally archives audio.
 
 It replaces a 1225-line shell transaction system and a 591-line Python
 transcriber with one ordering argument: **the audio file is the only source
@@ -17,8 +17,17 @@ publishing the transcript and archiving the audio yields a visible duplicate
 ## Usage
 
 ```sh
+# Process files once; transcript goes in current directory and audio stays put.
+recordings memo.m4a interview.wav \
+  --prompt ~/doc/post-process.md \
+  --asr-url https://hera.lan:8443/v1 \
+  --asr-model cohere-transcribe-03-2026-mlx-fp16 \
+  --llm-url http://localhost:8000/v1 \
+  --llm-model GLM-5.3-Flash-oQ4e
+
+# One directory remains daemon mode; archive is optional.
 recordings ~/Recordings \
-  --output ~/Recordings \
+  --output ~/Documents/Inbox \
   --archive ~/Documents/Recordings \
   --prompt ~/doc/post-process.md \
   --asr-url https://hera.lan:8443/v1 \
@@ -27,29 +36,27 @@ recordings ~/Recordings \
   --llm-model GLM-5.3-Flash-oQ4e
 ```
 
+- Supplying audio file paths processes that exact set then exits. Supplying one
+  directory preserves watch mode. `--once` runs one directory sweep.
+- `--output` defaults to current directory. `--archive` is optional; without it,
+  successfully processed audio remains in place.
 - Native filesystem events (FSEvents on macOS, inotify on Linux) start a
   sweep the moment the watch tree changes, with an interval poll (default
-  30 s, `--poll`) as the fallback for anything events miss; a file is
-  processed only once its size and mtime are stable across two scans, so
-  half-synced uploads are left alone. `--once` runs a single sweep.
-- Audio is first converted to 16 kHz mono WAV (the model's native input)
-  with macOS-native `afconvert`, so no other component ever needs an m4a
-  decoder. Transcription then goes to an OpenAI-compatible
-  `/audio/transcriptions` endpoint (`--asr-url`/`--asr-model`), or — until
-  the server transcribes this model correctly — to a local command whose
-  stdout is the transcript and which receives the WAV path as its final
-  argument:
+  30 s, `--poll`) as fallback; a file is processed only once its size and
+  mtime are stable across two scans, so half-synced uploads are left alone.
+- Audio is first converted to 16 kHz mono WAV (the model's native input) with
+  macOS-native `afconvert`. Transcription uses an OpenAI-compatible
+  `/audio/transcriptions` endpoint (`--asr-url`/`--asr-model`) or a local
+  command whose stdout is transcript and receives WAV path last:
   `--asr-command "mlx-speech asr --model <model-dir> --language en --audio"`.
-- Cleanup posts the raw transcript with the prompt file's contents as the
-  system message to `/chat/completions` (`--llm-url`, `--llm-model`).
-- `SSL_CERT_FILE`, when set, is the CA bundle used to validate TLS
-  endpoints. `--api-key` (default `dummy-key`) is sent as a Bearer token.
-- A recording that keeps failing is retried on later sweeps and abandoned
-  after 5 attempts until its file changes or the daemon restarts; the audio
-  always stays put on failure.
-- Empty subdirectories of the watch tree (including `.DS_Store`-only ones)
-  are pruned after each sweep. State lives in `~/.local/state/recordings`.
-
+- Cleanup posts raw transcript with prompt file contents as system message to
+  `/chat/completions` (`--llm-url`, `--llm-model`).
+- `SSL_CERT_FILE`, when set, is CA bundle used to validate TLS endpoints.
+  `--api-key` (default `dummy-key`) is sent as Bearer token.
+- A recording that keeps failing is retried on later sweeps and abandoned after
+  5 attempts until file changes or daemon restarts; audio stays put on failure.
+- Empty subdirectories of watch tree (including `.DS_Store`-only ones) are
+  pruned after each sweep. State lives in `~/.local/state/recordings`.
 ## Deployment (nix-darwin launchd)
 
 The daemon subsumes the old fswatch pipeline; the service reduces to a

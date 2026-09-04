@@ -49,9 +49,10 @@ pub enum Transcriber {
 
 #[derive(Clone)]
 pub struct Options {
-    pub watch_dir: PathBuf,
-    pub output_dir: PathBuf,
-    pub archive_dir: PathBuf,
+    pub watch_dir: Option<PathBuf>,
+    pub audio_files: Vec<PathBuf>,
+    pub output_dir: Option<PathBuf>,
+    pub archive_dir: Option<PathBuf>,
     pub prompt_file: PathBuf,
     pub transcriber: Transcriber,
     pub llm_url: String,
@@ -69,17 +70,17 @@ pub struct Options {
     group(ArgGroup::new("transcriber").required(true).args(["asr_url", "asr_command"]))
 )]
 struct Cli {
-    /// Directory tree to watch for audio files.
-    #[arg(value_name = "WATCH_DIR")]
-    watch_dir: PathBuf,
+    /// Audio file(s) to process, or one directory tree to watch.
+    #[arg(value_name = "PATH", num_args = 1..)]
+    paths: Vec<PathBuf>,
 
-    /// Directory receiving cleaned .txt transcripts.
+    /// Directory receiving cleaned .txt transcripts. Defaults to current directory.
     #[arg(long, value_name = "DIR")]
-    output: PathBuf,
+    output: Option<PathBuf>,
 
-    /// Directory receiving processed audio files.
+    /// Directory receiving processed audio files. Omit to keep the audio files.
     #[arg(long, value_name = "DIR")]
-    archive: PathBuf,
+    archive: Option<PathBuf>,
 
     /// Markdown file holding the fix-transcription prompt.
     #[arg(long, value_name = "FILE")]
@@ -127,7 +128,7 @@ struct Cli {
     #[arg(long, value_name = "SECONDS", default_value_t = 30)]
     poll: i64,
 
-    /// Run a single sweep and exit.
+    /// Run a single directory sweep and exit.
     #[arg(long)]
     once: bool,
 }
@@ -140,8 +141,16 @@ impl Options {
             (None, None, Some(command)) => Transcriber::AsrShell(command),
             _ => unreachable!("transcriber arguments are validated by clap"),
         };
+        let watch_dir =
+            (cli.paths.len() == 1 && cli.paths[0].is_dir()).then(|| cli.paths[0].clone());
+        let audio_files = if watch_dir.is_some() {
+            Vec::new()
+        } else {
+            cli.paths
+        };
         Self {
-            watch_dir: cli.watch_dir,
+            watch_dir,
+            audio_files,
             output_dir: cli.output,
             archive_dir: cli.archive,
             prompt_file: cli.prompt,
@@ -397,15 +406,15 @@ pub fn move_path(source: &Path, destination: &Path) -> io::Result<()> {
     sync_parent(source)
 }
 
-/// First stem whose transcript and archive destinations are both free.
+/// First stem whose transcript and optional archive destinations are free.
 ///
-/// ponytail: existence-check then create; safe because daemon lock makes this
-/// process sole writer, so no uniquification race exists.
+/// ponytail: existence-check then create; process lock makes this process sole
+/// writer, so no uniquification race exists.
 pub fn fresh_targets(
     output_dir: &Path,
-    archive_dir: &Path,
+    archive_dir: Option<&Path>,
     audio: &Path,
-) -> io::Result<(PathBuf, PathBuf)> {
+) -> io::Result<(PathBuf, Option<PathBuf>)> {
     let stem = audio
         .file_stem()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "audio has no file stem"))?;
@@ -420,17 +429,37 @@ pub fn fresh_targets(
         transcript_name.push(".txt");
         let transcript = output_dir.join(transcript_name);
 
-        let mut archive_name = candidate;
-        if let Some(extension) = extension {
-            archive_name.push(".");
-            archive_name.push(extension);
-        }
-        let archive = archive_dir.join(archive_name);
-        if !transcript.try_exists()? && !archive.try_exists()? {
+        let archive = archive_dir.map(|archive_dir| {
+            let mut archive_name = candidate;
+            if let Some(extension) = extension {
+                archive_name.push(".");
+                archive_name.push(extension);
+            }
+            archive_dir.join(archive_name)
+        });
+        if !transcript.try_exists()?
+            && archive
+                .as_ref()
+                .map_or(Ok(true), |path| path.try_exists().map(|exists| !exists))?
+        {
             return Ok((transcript, archive));
         }
     }
     unreachable!("target stem sequence is infinite")
+}
+
+fn publish_cleaned(
+    output_dir: &Path,
+    archive_dir: Option<&Path>,
+    audio: &Path,
+    cleaned: &str,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    let (transcript, archive) = fresh_targets(output_dir, archive_dir, audio)?;
+    write_file_durable(&transcript, &format!("{}\n", cleaned.trim_end()))?;
+    if let Some(archive) = &archive {
+        move_path(audio, archive)?;
+    }
+    Ok((transcript, archive))
 }
 
 fn hidden(name: &OsStr) -> bool {
@@ -647,14 +676,17 @@ fn blank(text: &str) -> bool {
 ///
 /// 1. spool raw transcript durably before cleanup;
 /// 2. publish cleaned transcript durably before touching audio;
-/// 3. move audio to archive, then remove spool.
+/// 3. optionally move audio to archive, then remove spool.
 ///
 /// ponytail: crash exactly between 2 and 3 republishes under `name-2` on next
 /// sweep: visible duplicate, never loss.
 fn process_file(env: &Env, audio: &Path, identity: &Identity) -> Result<()> {
-    let relative = audio
-        .strip_prefix(&env.opts.watch_dir)
-        .with_context(|| format!("{} is outside watch tree", audio.display()))?;
+    let relative = match &env.opts.watch_dir {
+        Some(watch_dir) => audio
+            .strip_prefix(watch_dir)
+            .with_context(|| format!("{} is outside watch tree", audio.display()))?,
+        None => audio,
+    };
     let spool = env.state_dir.join(spool_name(relative, identity));
 
     let raw = if spool.is_file() {
@@ -684,21 +716,33 @@ fn process_file(env: &Env, audio: &Path, identity: &Identity) -> Result<()> {
         bail!("{} changed while being processed", relative.display());
     }
 
-    let (transcript, archive) = fresh_targets(&env.opts.output_dir, &env.opts.archive_dir, audio)?;
-    write_file_durable(&transcript, &format!("{}\n", cleaned.trim_end()))?;
-    move_path(audio, &archive)?;
+    let (transcript, archive) = publish_cleaned(
+        env.opts
+            .output_dir
+            .as_deref()
+            .expect("output directory is set"),
+        env.opts.archive_dir.as_deref(),
+        audio,
+        &cleaned,
+    )?;
     remove_quietly(&spool);
-    log_msg(&format!(
-        "published {}; archived {}",
-        transcript
-            .file_name()
-            .unwrap_or(transcript.as_os_str())
-            .to_string_lossy(),
-        archive
-            .file_name()
-            .unwrap_or(archive.as_os_str())
-            .to_string_lossy()
-    ));
+    let transcript = transcript
+        .file_name()
+        .unwrap_or(transcript.as_os_str())
+        .to_string_lossy();
+    match archive {
+        Some(archive) => log_msg(&format!(
+            "published {transcript}; archived {}",
+            archive
+                .file_name()
+                .unwrap_or(archive.as_os_str())
+                .to_string_lossy()
+        )),
+        None => log_msg(&format!(
+            "published {transcript}; kept {}",
+            relative.display()
+        )),
+    }
     Ok(())
 }
 
@@ -779,15 +823,20 @@ fn step_file(env: &Env, scan: &BTreeMap<PathBuf, Identity>, failures: &mut Failu
 }
 
 fn sweep(env: &Env, failures: &mut Failures) {
-    let before = scan_audio(&env.opts.watch_dir);
+    let watch_dir = env
+        .opts
+        .watch_dir
+        .as_deref()
+        .expect("sweep only runs in watch mode");
+    let before = scan_audio(watch_dir);
     if !before.is_empty() {
         thread::sleep(Duration::from_secs(2));
     }
-    let after = scan_audio(&env.opts.watch_dir);
+    let after = scan_audio(watch_dir);
     for audio in ready_files(&before, &after) {
         step_file(env, &after, failures, &audio);
     }
-    prune_empty_dirs(&env.opts.watch_dir);
+    prune_empty_dirs(watch_dir);
     failures.retain(|path, _| after.contains_key(path));
 }
 
@@ -828,25 +877,48 @@ fn wait_for_kick(receiver: &Receiver<()>, timeout: Duration, watching: bool) {
 }
 
 pub fn run(mut options: Options) -> Result<()> {
-    options.watch_dir = absolute(&options.watch_dir)?;
-    options.output_dir = absolute(&options.output_dir)?;
-    options.archive_dir = absolute(&options.archive_dir)?;
+    options.watch_dir = options.watch_dir.map(|path| absolute(&path)).transpose()?;
+    options.audio_files = options
+        .audio_files
+        .into_iter()
+        .map(|path| absolute(&path))
+        .collect::<io::Result<_>>()?;
+    options.output_dir = Some(absolute(options.output_dir.unwrap_or(env::current_dir()?))?);
+    options.archive_dir = options
+        .archive_dir
+        .map(|path| absolute(&path))
+        .transpose()?;
     let state_dir = state_dir()?;
 
     fs::create_dir_all(&state_dir)?;
-    fs::create_dir_all(&options.output_dir)?;
-    fs::create_dir_all(&options.archive_dir)?;
-    let checked_watch = canonicalize_if_exists(&options.watch_dir)
-        .with_context(|| format!("cannot resolve watch tree {}", options.watch_dir.display()))?;
-    for (name, directory) in [("--archive", &options.archive_dir), ("state", &state_dir)] {
-        let checked_directory = fs::canonicalize(directory)
-            .with_context(|| format!("cannot resolve {name} directory {}", directory.display()))?;
-        if is_inside(&checked_watch, &checked_directory) {
-            bail!(
-                "{name} directory {} lies inside watch tree {}",
-                directory.display(),
-                options.watch_dir.display()
-            );
+    fs::create_dir_all(
+        options
+            .output_dir
+            .as_ref()
+            .expect("output directory is set"),
+    )?;
+    if let Some(archive_dir) = &options.archive_dir {
+        fs::create_dir_all(archive_dir)?;
+    }
+    if let Some(watch_dir) = &options.watch_dir {
+        let checked_watch = canonicalize_if_exists(watch_dir)
+            .with_context(|| format!("cannot resolve watch tree {}", watch_dir.display()))?;
+        for (name, directory) in std::iter::once(("state", &state_dir)).chain(
+            options
+                .archive_dir
+                .as_ref()
+                .map(|directory| ("--archive", directory)),
+        ) {
+            let checked_directory = fs::canonicalize(directory).with_context(|| {
+                format!("cannot resolve {name} directory {}", directory.display())
+            })?;
+            if is_inside(&checked_watch, &checked_directory) {
+                bail!(
+                    "{name} directory {} lies inside watch tree {}",
+                    directory.display(),
+                    watch_dir.display()
+                );
+            }
         }
     }
     if !options.prompt_file.is_file() {
@@ -874,11 +946,42 @@ pub fn run(mut options: Options) -> Result<()> {
         state_dir,
         client: new_http_client()?,
     };
+    if env.opts.watch_dir.is_none() {
+        let mut failed = 0;
+        for audio in &env.opts.audio_files {
+            if !audio.is_file() || !audio.file_name().is_some_and(is_audio_os_name) {
+                bail!("not a supported audio file: {}", audio.display());
+            }
+            let identity = file_identity(audio)
+                .ok_or_else(|| anyhow!("cannot read audio file {}", audio.display()))?;
+            if let Err(error) = process_file(&env, audio, &identity) {
+                failed += 1;
+                log_msg(&format!("ERROR processing {}: {error:#}", audio.display()));
+            }
+        }
+        if failed != 0 {
+            bail!("{failed} audio file(s) failed");
+        }
+        return Ok(());
+    }
+
+    let watch_dir = env
+        .opts
+        .watch_dir
+        .as_deref()
+        .expect("watch directory is set");
     log_msg(&format!(
-        "watching {} -> {} (archive {})",
-        env.opts.watch_dir.display(),
-        env.opts.output_dir.display(),
-        env.opts.archive_dir.display()
+        "watching {} -> {} ({})",
+        watch_dir.display(),
+        env.opts
+            .output_dir
+            .as_ref()
+            .expect("output directory is set")
+            .display(),
+        env.opts.archive_dir.as_ref().map_or_else(
+            || "keeping audio".to_owned(),
+            |path| format!("archive {}", path.display())
+        )
     ));
 
     let mut failures = BTreeMap::new();
@@ -888,7 +991,7 @@ pub fn run(mut options: Options) -> Result<()> {
     }
 
     let (sender, receiver) = mpsc::sync_channel(1);
-    let watcher = match start_watcher(&env.opts.watch_dir, sender) {
+    let watcher = match start_watcher(watch_dir, sender) {
         Ok(watcher) => {
             log_msg("filesystem events active");
             Some(watcher)
@@ -906,5 +1009,25 @@ pub fn run(mut options: Options) -> Result<()> {
     loop {
         sweep(&env, &mut failures);
         wait_for_kick(&receiver, poll, watcher.is_some());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publishing_without_archive_keeps_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("memo.m4a");
+        let output = dir.path().join("transcripts");
+        fs::write(&audio, "audio").unwrap();
+        fs::create_dir(&output).unwrap();
+
+        let (transcript, archive) = publish_cleaned(&output, None, &audio, "clean").unwrap();
+
+        assert_eq!(fs::read_to_string(transcript).unwrap(), "clean\n");
+        assert_eq!(archive, None);
+        assert!(audio.is_file());
     }
 }

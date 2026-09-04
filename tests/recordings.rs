@@ -177,9 +177,18 @@ fn move_path_moves_content_and_removes_source() {
 fn fresh_targets_uses_plain_stem_when_free() {
     let dir = tempdir().unwrap();
     let (txt, archive) =
-        fresh_targets(dir.path(), dir.path(), &dir.path().join("memo.m4a")).unwrap();
+        fresh_targets(dir.path(), Some(dir.path()), &dir.path().join("memo.m4a")).unwrap();
     assert_eq!(txt, dir.path().join("memo.txt"));
-    assert_eq!(archive, dir.path().join("memo.m4a"));
+    assert_eq!(archive, Some(dir.path().join("memo.m4a")));
+}
+
+#[test]
+fn fresh_targets_without_archive_only_reserves_transcript_name() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("memo.m4a"), "audio").unwrap();
+    let (txt, archive) = fresh_targets(dir.path(), None, &dir.path().join("memo.m4a")).unwrap();
+    assert_eq!(txt, dir.path().join("memo.txt"));
+    assert_eq!(archive, None);
 }
 
 #[test]
@@ -187,9 +196,9 @@ fn fresh_targets_moves_to_two_when_either_destination_is_taken() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("memo.txt"), "occupied").unwrap();
     let (txt, archive) =
-        fresh_targets(dir.path(), dir.path(), &dir.path().join("memo.m4a")).unwrap();
+        fresh_targets(dir.path(), Some(dir.path()), &dir.path().join("memo.m4a")).unwrap();
     assert_eq!(txt, dir.path().join("memo-2.txt"));
-    assert_eq!(archive, dir.path().join("memo-2.m4a"));
+    assert_eq!(archive, Some(dir.path().join("memo-2.m4a")));
 }
 
 #[test]
