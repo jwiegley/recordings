@@ -56,7 +56,10 @@ recordings ~/Recordings \
 - A recording that keeps failing is retried on later sweeps and abandoned after
   5 attempts until file changes or daemon restarts; audio stays put on failure.
 - Empty subdirectories of watch tree (including `.DS_Store`-only ones) are
-  pruned after each sweep. State lives in `~/.local/state/recordings`.
+  pruned after each sweep, but only once untouched for 24 hours. The watch tree
+  is typically a sync folder, where a directory that reads as empty locally may
+  still be the destination of an upload in flight from another device.
+  State lives in `~/.local/state/recordings`.
 ## Deployment (nix-darwin launchd)
 
 The daemon subsumes the old fswatch pipeline; the service reduces to a

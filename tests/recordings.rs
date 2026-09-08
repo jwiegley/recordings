@@ -3,11 +3,20 @@ use serde_json::to_vec;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
 fn some_time() -> std::time::SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_788_134_400)
+}
+
+/// Age a directory so prune sees it as idle without the test having to wait.
+fn backdate(path: &Path, age: Duration) {
+    let when = SystemTime::now() - age;
+    let handle = fs::File::open(path).unwrap();
+    handle
+        .set_times(fs::FileTimes::new().set_accessed(when).set_modified(when))
+        .unwrap();
 }
 
 #[test]
@@ -209,11 +218,60 @@ fn prune_removes_empty_and_ds_store_only_subdirs_but_not_root() {
     fs::create_dir_all(dir.path().join("keep")).unwrap();
     fs::write(dir.path().join("junk/.DS_Store"), "").unwrap();
     fs::write(dir.path().join("keep/file.m4a"), "x").unwrap();
-    prune_empty_dirs(dir.path());
+    prune_empty_dirs(dir.path(), Duration::ZERO);
     assert!(!dir.path().join("empty1").is_dir());
     assert!(!dir.path().join("junk").is_dir());
     assert!(dir.path().join("keep").is_dir());
     assert!(dir.path().is_dir());
+}
+
+#[test]
+fn prune_spares_empty_dirs_until_they_have_been_idle_long_enough() {
+    let dir = tempdir().unwrap();
+    let fresh = dir.path().join("2026-09-06");
+    let stale = dir.path().join("2026-09-01");
+    fs::create_dir(&fresh).unwrap();
+    fs::create_dir(&stale).unwrap();
+    backdate(&stale, PRUNE_MIN_IDLE + Duration::from_secs(60));
+
+    prune_empty_dirs(dir.path(), PRUNE_MIN_IDLE);
+
+    // A date directory another device may still be uploading into survives,
+    // which is the whole point of the delay.
+    assert!(fresh.is_dir());
+    // Yesterday's leftovers are still collected, so they cannot pile up.
+    assert!(!stale.is_dir());
+}
+
+#[test]
+fn prune_leaves_ds_store_alone_while_the_directory_is_too_young() {
+    let dir = tempdir().unwrap();
+    let fresh = dir.path().join("2026-09-06");
+    fs::create_dir(&fresh).unwrap();
+    fs::write(fresh.join(".DS_Store"), "").unwrap();
+
+    prune_empty_dirs(dir.path(), PRUNE_MIN_IDLE);
+
+    // Deleting the .DS_Store is part of pruning, so it must wait too.
+    assert!(fresh.join(".DS_Store").is_file());
+}
+
+#[test]
+fn prune_keeps_a_directory_whose_child_was_just_removed() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let inner = outer.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    // Innermost first: creating a child bumps the parent's mtime.
+    backdate(&inner, PRUNE_MIN_IDLE + Duration::from_secs(60));
+    backdate(&outer, PRUNE_MIN_IDLE + Duration::from_secs(60));
+
+    prune_empty_dirs(dir.path(), PRUNE_MIN_IDLE);
+
+    // `inner` was old enough to go; `outer` is judged on the mtime it had
+    // before that removal bumped it, so one pass collects the whole chain.
+    assert!(!inner.is_dir());
+    assert!(!outer.is_dir());
 }
 
 #[test]

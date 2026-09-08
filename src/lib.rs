@@ -32,6 +32,10 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "m4a", "mp3", "wav", "aac", "flac", "ogg", "opus", "aiff", "aif",
 ];
 const MAX_ATTEMPTS: usize = 5;
+/// How long an empty directory must sit untouched before it is pruned. Long
+/// enough that a recording still uploading from a phone cannot have its date
+/// directory removed underneath it.
+pub const PRUNE_MIN_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Cheap file identity: size and modification time.
 ///
@@ -473,10 +477,19 @@ fn hidden(name: &OsStr) -> bool {
     }
 }
 
-/// Remove non-root subdirectories empty except for `.DS_Store` files.
+/// Remove non-root subdirectories empty except for `.DS_Store` files, once
+/// they have gone `min_idle` without being touched.
 /// Hidden directories and symlinks are left alone.
-pub fn prune_empty_dirs(root: &Path) {
-    fn prune(directory: &Path, is_root: bool) -> bool {
+///
+/// The delay matters because the watch tree is a sync folder: a directory that
+/// reads as empty here may still be the destination of an upload in flight
+/// from another device, and removing it would delete that destination out from
+/// under the upload.
+pub fn prune_empty_dirs(root: &Path, min_idle: Duration) {
+    fn prune(directory: &Path, is_root: bool, min_idle: Duration, now: SystemTime) -> bool {
+        // Sample before recursing: pruning a child bumps this directory's
+        // mtime, which would otherwise hide how long it has really been idle.
+        let modified = fs::metadata(directory).and_then(|metadata| metadata.modified());
         let Ok(entries) = fs::read_dir(directory) else {
             return false;
         };
@@ -491,7 +504,7 @@ pub fn prune_empty_dirs(root: &Path) {
                 .map(|metadata| metadata.file_type().is_symlink())
                 .unwrap_or(true);
             if !is_symlink && path.is_dir() && !hidden(&name) {
-                if !prune(&path, false) {
+                if !prune(&path, false, min_idle, now) {
                     remaining.push(name);
                 }
             } else {
@@ -499,7 +512,15 @@ pub fn prune_empty_dirs(root: &Path) {
             }
         }
 
+        // An unreadable or future-dated mtime counts as "not idle yet", so a
+        // surprise always costs tidiness rather than data.
+        let idle_enough = modified
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|idle| idle >= min_idle);
+
         if !is_root
+            && idle_enough
             && remaining
                 .iter()
                 .all(|name| name.as_os_str() == OsStr::new(".DS_Store"))
@@ -513,7 +534,7 @@ pub fn prune_empty_dirs(root: &Path) {
         }
     }
 
-    prune(root, true);
+    prune(root, true, min_idle, SystemTime::now());
 }
 
 struct Env {
@@ -836,7 +857,7 @@ fn sweep(env: &Env, failures: &mut Failures) {
     for audio in ready_files(&before, &after) {
         step_file(env, &after, failures, &audio);
     }
-    prune_empty_dirs(watch_dir);
+    prune_empty_dirs(watch_dir, PRUNE_MIN_IDLE);
     failures.retain(|path, _| after.contains_key(path));
 }
 
