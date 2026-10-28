@@ -211,6 +211,97 @@ fn fresh_targets_moves_to_two_when_either_destination_is_taken() {
 }
 
 #[test]
+fn audio_checksum_is_the_first_256_bits_of_sha512() {
+    let dir = tempdir().unwrap();
+    let audio = dir.path().join("memo.m4a");
+    fs::write(&audio, "abc").unwrap();
+    // FIPS 180-2 SHA-512("abc"), truncated; SHA-512/256 would give 53048e26....
+    assert_eq!(
+        audio_checksum(&audio).unwrap(),
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+    );
+}
+
+#[test]
+fn audio_checksum_digests_files_longer_than_one_read() {
+    let dir = tempdir().unwrap();
+    let audio = dir.path().join("long.wav");
+    fs::write(&audio, vec![b'a'; 1_000_000]).unwrap();
+    // FIPS 180-2 SHA-512 of one million 'a' bytes, truncated.
+    assert_eq!(
+        audio_checksum(&audio).unwrap(),
+        "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973eb"
+    );
+}
+
+#[test]
+fn provenance_drawer_links_audio_under_home_with_tilde() {
+    let checksum = "ab".repeat(32);
+    assert_eq!(
+        provenance_drawer(
+            Path::new("/Users/me/Documents/Recordings/06-50-28.m4a"),
+            &checksum,
+            Some(Path::new("/Users/me")),
+        ),
+        format!(
+            ":PROPERTIES:\n\
+             :RECORDING_AUDIO: [[file:~/Documents/Recordings/06-50-28.m4a]]\n\
+             :RECORDING_AUDIO_SHA512_256: {checksum}\n\
+             :END:\n"
+        )
+    );
+}
+
+/// The `:RECORDING_AUDIO:` line of a provenance drawer.
+fn audio_line(audio: &str, home: Option<&str>) -> String {
+    provenance_drawer(Path::new(audio), "00", home.map(Path::new))
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn provenance_drawer_keeps_audio_outside_home_absolute() {
+    // A sibling whose name merely extends home's is not inside it.
+    assert_eq!(
+        audio_line("/Users/me2/x.m4a", Some("/Users/me")),
+        ":RECORDING_AUDIO: [[file:/Users/me2/x.m4a]]"
+    );
+    assert_eq!(
+        audio_line("/Users/me/x.m4a", None),
+        ":RECORDING_AUDIO: [[file:/Users/me/x.m4a]]"
+    );
+    // A root home would turn every path into `~/...`, which no other reader
+    // could resolve; Emacs's `abbreviate-file-name` declines it too.
+    assert_eq!(
+        audio_line("/Users/me/x.m4a", Some("/")),
+        ":RECORDING_AUDIO: [[file:/Users/me/x.m4a]]"
+    );
+}
+
+#[test]
+fn provenance_drawer_escapes_links_as_org_does() {
+    // Expected values are Emacs's own `org-link-make-string` output.
+    assert_eq!(
+        audio_line("/rec/Interview [raw].m4a", None),
+        r":RECORDING_AUDIO: [[file:/rec/Interview \[raw\].m4a]]"
+    );
+    assert_eq!(
+        audio_line(r"/rec/a\[b].m4a", None),
+        r":RECORDING_AUDIO: [[file:/rec/a\\\[b\].m4a]]"
+    );
+    assert_eq!(
+        audio_line(r"/rec/odd\", None),
+        r":RECORDING_AUDIO: [[file:/rec/odd\\]]"
+    );
+    assert_eq!(
+        audio_line(r"/rec/x\y.m4a", None),
+        r":RECORDING_AUDIO: [[file:/rec/x\y.m4a]]"
+    );
+}
+
+#[test]
 fn prune_removes_empty_and_ds_store_only_subdirs_but_not_root() {
     let dir = tempdir().unwrap();
     fs::create_dir_all(dir.path().join("empty1/empty2")).unwrap();

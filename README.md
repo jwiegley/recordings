@@ -12,7 +12,9 @@ rename). A crash at any point leaves either the audio still in place — the
 next sweep redoes the work, reusing the spooled raw transcript when the file
 is unchanged — or the work complete. The rare crash exactly between
 publishing the transcript and archiving the audio yields a visible duplicate
-(`name-2.txt`) on the next sweep, never a loss.
+(`name-2.txt`) on the next sweep, never a loss; the first copy's audio link
+then names an archive path its audio never reached, while its checksum still
+identifies the audio archived as `name-2`.
 
 ## Usage
 
@@ -51,6 +53,20 @@ recordings ~/Recordings \
   `--asr-command "mlx-speech asr --model <model-dir> --language en --audio"`.
 - Cleanup posts raw transcript with prompt file contents as system message to
   `/chat/completions` (`--llm-url`, `--llm-model`).
+- Each transcript opens with an Org property drawer recording its source: a
+  `file:` link to the audio where it ends up (the archive when `--archive` is
+  given, `~/...` when under `$HOME`) and the first 256 bits of the audio's
+  SHA-512. That is org-hash's `sha512_256`, not FIPS SHA-512/256, so
+  `shasum -a 512 FILE | cut -c1-64` checks it. org-ext's import keeps both as
+  properties of the Org entry:
+
+  ```org
+  :PROPERTIES:
+  :RECORDING_AUDIO: [[file:~/Documents/Recordings/06-50-28.m4a]]
+  :RECORDING_AUDIO_SHA512_256: 9e8074485a109345c19459495646bf87451b8c0f37dfb80b41d3035127e84b23
+  :END:
+  Cleaned transcript text...
+  ```
 - `SSL_CERT_FILE`, when set, is CA bundle used to validate TLS endpoints.
   `--api-key` (default `dummy-key`) is sent as Bearer token.
 - A recording that keeps failing is retried on later sweeps and abandoned after

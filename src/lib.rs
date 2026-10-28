@@ -9,6 +9,7 @@
 //! raw transcript) or work complete.
 
 use anyhow::{Context, Result, anyhow, bail};
+use aws_lc_rs::digest;
 use chrono::Local;
 use clap::{ArgGroup, Parser};
 use notify::{RecursiveMode, Watcher};
@@ -19,7 +20,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, FileTimes, OpenOptions, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf, absolute};
@@ -452,14 +453,87 @@ pub fn fresh_targets(
     unreachable!("target stem sequence is infinite")
 }
 
+/// First 256 bits of a file's SHA-512 digest, as 64 lowercase hex digits.
+///
+/// This is `sha512_256` in org-hash's sense: truncated SHA-512, not the
+/// distinct FIPS SHA-512/256 algorithm. `shasum -a 512 FILE | cut -c1-64`
+/// reproduces it.
+pub fn audio_checksum(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut context = digest::Context::new(&digest::SHA512);
+    let mut buffer = vec![0; 1 << 16];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => context.update(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(context.finish().as_ref()[..32]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Backslash-escape a link as Org's `org-link-escape` does: `[` and `]` gain
+/// a backslash, and backslashes before them or at the end are doubled.
+fn org_link_escape(link: &str) -> String {
+    let mut escaped = String::with_capacity(link.len());
+    let mut backslashes = 0;
+    for character in link.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '[' | ']' => {
+                escaped.push_str(&"\\".repeat(2 * backslashes + 1));
+                escaped.push(character);
+                backslashes = 0;
+            }
+            _ => {
+                escaped.push_str(&"\\".repeat(backslashes));
+                escaped.push(character);
+                backslashes = 0;
+            }
+        }
+    }
+    escaped.push_str(&"\\".repeat(2 * backslashes));
+    escaped
+}
+
+/// Org property drawer heading a transcript with the audio it came from.
+///
+/// org-ext carries these properties onto the Org entry it imports, keeping a
+/// link to the recording and the `audio_checksum` that shows the file is
+/// unchanged. Audio under `home` is linked as `~/...`, unless `home` is the
+/// root, which, as with Emacs's `abbreviate-file-name`, abbreviates nothing.
+pub fn provenance_drawer(audio: &Path, checksum: &str, home: Option<&Path>) -> String {
+    let home = home.filter(|home| home.parent().is_some());
+    let path = match home.and_then(|home| audio.strip_prefix(home).ok()) {
+        Some(relative) => Path::new("~").join(relative),
+        None => audio.to_owned(),
+    };
+    format!(
+        ":PROPERTIES:\n\
+         :RECORDING_AUDIO: [[file:{}]]\n\
+         :RECORDING_AUDIO_SHA512_256: {checksum}\n\
+         :END:\n",
+        org_link_escape(&path.to_string_lossy())
+    )
+}
+
+/// Publish the transcript, headed by the provenance of the audio at its final
+/// location, then archive the audio when an archive directory is given.
 fn publish_cleaned(
     output_dir: &Path,
     archive_dir: Option<&Path>,
     audio: &Path,
     cleaned: &str,
+    checksum: &str,
+    home: Option<&Path>,
 ) -> Result<(PathBuf, Option<PathBuf>)> {
     let (transcript, archive) = fresh_targets(output_dir, archive_dir, audio)?;
-    write_file_durable(&transcript, &format!("{}\n", cleaned.trim_end()))?;
+    let drawer = provenance_drawer(archive.as_deref().unwrap_or(audio), checksum, home);
+    write_file_durable(&transcript, &format!("{drawer}{}\n", cleaned.trim_end()))?;
     if let Some(archive) = &archive {
         move_path(audio, archive)?;
     }
@@ -540,6 +614,8 @@ pub fn prune_empty_dirs(root: &Path, min_idle: Duration) {
 struct Env {
     opts: Options,
     state_dir: PathBuf,
+    /// Audio links below this directory are written relative to `~`.
+    home: Option<PathBuf>,
     client: Client,
 }
 
@@ -696,11 +772,15 @@ fn blank(text: &str) -> bool {
 /// Per-file crash-safe pipeline:
 ///
 /// 1. spool raw transcript durably before cleanup;
-/// 2. publish cleaned transcript durably before touching audio;
+/// 2. publish cleaned transcript, headed by the audio's final location and
+///    checksum, durably before touching audio;
 /// 3. optionally move audio to archive, then remove spool.
 ///
 /// ponytail: crash exactly between 2 and 3 republishes under `name-2` on next
-/// sweep: visible duplicate, never loss.
+/// sweep: visible duplicate, never loss. The first copy's audio link then
+/// names an archive path the audio never reached, which a later recording with
+/// the same stem may take; its checksum still identifies the audio, now
+/// archived as `name-2`. A failed move has the same effect.
 fn process_file(env: &Env, audio: &Path, identity: &Identity) -> Result<()> {
     let relative = match &env.opts.watch_dir {
         Some(watch_dir) => audio
@@ -733,6 +813,10 @@ fn process_file(env: &Env, audio: &Path, identity: &Identity) -> Result<()> {
     if blank(&cleaned) {
         bail!("empty cleanup result for {}", relative.display());
     }
+    // Checksum before the identity check, so the digest is of the very file
+    // that was transcribed.
+    let checksum =
+        audio_checksum(audio).with_context(|| format!("cannot checksum {}", relative.display()))?;
     if file_identity(audio) != Some(*identity) {
         bail!("{} changed while being processed", relative.display());
     }
@@ -745,6 +829,8 @@ fn process_file(env: &Env, audio: &Path, identity: &Identity) -> Result<()> {
         env.opts.archive_dir.as_deref(),
         audio,
         &cleaned,
+        &checksum,
+        env.home.as_deref(),
     )?;
     remove_quietly(&spool);
     let transcript = transcript
@@ -965,6 +1051,7 @@ pub fn run(mut options: Options) -> Result<()> {
     let env = Env {
         opts: options,
         state_dir,
+        home: env::var_os("HOME").map(PathBuf::from),
         client: new_http_client()?,
     };
     if env.opts.watch_dir.is_none() {
@@ -1038,17 +1125,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn publishing_without_archive_keeps_audio() {
+    fn publishing_without_archive_keeps_audio_and_links_it_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let audio = dir.path().join("memo.m4a");
         let output = dir.path().join("transcripts");
         fs::write(&audio, "audio").unwrap();
         fs::create_dir(&output).unwrap();
 
-        let (transcript, archive) = publish_cleaned(&output, None, &audio, "clean").unwrap();
+        let (transcript, archive) =
+            publish_cleaned(&output, None, &audio, "clean", "c0ffee", None).unwrap();
 
-        assert_eq!(fs::read_to_string(transcript).unwrap(), "clean\n");
+        assert_eq!(
+            fs::read_to_string(transcript).unwrap(),
+            format!(
+                ":PROPERTIES:\n\
+                 :RECORDING_AUDIO: [[file:{}]]\n\
+                 :RECORDING_AUDIO_SHA512_256: c0ffee\n\
+                 :END:\n\
+                 clean\n",
+                audio.display()
+            )
+        );
         assert_eq!(archive, None);
         assert!(audio.is_file());
+    }
+
+    #[test]
+    fn publishing_with_archive_links_the_name_the_audio_was_archived_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("memo.m4a");
+        let output = dir.path().join("transcripts");
+        let archive_dir = dir.path().join("archive");
+        fs::write(&audio, "audio").unwrap();
+        fs::create_dir(&output).unwrap();
+        fs::create_dir(&archive_dir).unwrap();
+        // An earlier transcript holds the plain stem, so this one is `memo-2`.
+        fs::write(output.join("memo.txt"), "earlier").unwrap();
+
+        let (transcript, archive) =
+            publish_cleaned(&output, Some(&archive_dir), &audio, "clean", "c0ffee", None).unwrap();
+
+        let archived = archive_dir.join("memo-2.m4a");
+        assert_eq!(archive.as_deref(), Some(archived.as_path()));
+        assert_eq!(fs::read(&archived).unwrap(), b"audio");
+        assert!(
+            fs::read_to_string(transcript)
+                .unwrap()
+                .starts_with(&format!(
+                    ":PROPERTIES:\n:RECORDING_AUDIO: [[file:{}]]\n",
+                    archived.display()
+                ))
+        );
     }
 }

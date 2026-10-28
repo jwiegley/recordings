@@ -1017,6 +1017,7 @@ name = "recordings"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "chrono",
  "clap",
  "notify",

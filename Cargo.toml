@@ -9,6 +9,8 @@ authors = ["John Wiegley <johnw@newartisans.com>"]
 
 [dependencies]
 anyhow = "1.0"
+# Already linked as rustls's crypto provider; only its digests are used here.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.6", features = ["derive"] }
 notify = "8.2"
