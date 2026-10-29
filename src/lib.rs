@@ -33,6 +33,10 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "m4a", "mp3", "wav", "aac", "flac", "ogg", "opus", "aiff", "aif",
 ];
 const MAX_ATTEMPTS: usize = 5;
+/// Watch mode leaves a recording longer than this in place untranscribed:
+/// Cohere transcribes long audio too poorly to be worth it. Naming the file
+/// on the command line still transcribes it.
+const MAX_DURATION: Duration = Duration::from_secs(10 * 60);
 /// How long an empty directory must sit untouched before it is pruned. Long
 /// enough that a recording still uploading from a phone cannot have its date
 /// directory removed underneath it.
@@ -339,6 +343,17 @@ pub fn decode_chat_text(body: &[u8]) -> Result<String> {
         .ok_or_else(|| anyhow!("missing string field `message.content` in completion"))
 }
 
+/// Duration from the `estimated duration: 660.000 sec` line of `afinfo -r`.
+pub fn afinfo_duration(output: &str) -> Option<Duration> {
+    output.lines().find_map(|line| {
+        let seconds = line
+            .strip_prefix("estimated duration:")?
+            .strip_suffix("sec")?
+            .trim();
+        Duration::try_from_secs_f64(seconds.parse().ok()?).ok()
+    })
+}
+
 fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
@@ -619,7 +634,15 @@ struct Env {
     client: Client,
 }
 
-type Failures = BTreeMap<PathBuf, (Identity, usize)>;
+/// What sweeps have concluded about a file, standing while its identity holds.
+enum Verdict {
+    /// Processing has failed this many times running.
+    Failed(usize),
+    /// The recording runs past `MAX_DURATION`, so it stays put untranscribed.
+    TooLong,
+}
+
+type Verdicts = BTreeMap<PathBuf, (Identity, Verdict)>;
 
 fn log_msg(message: &str) {
     let mut stdout = io::stdout().lock();
@@ -673,6 +696,28 @@ fn expect_ok(what: &str, response: Response) -> Result<Vec<u8>> {
 
 fn first_chars(limit: usize, bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).chars().take(limit).collect()
+}
+
+/// A recording's duration, as macOS's `afinfo` counts it from the file's
+/// packets, when it runs past `MAX_DURATION`.
+fn too_long(audio: &Path) -> Result<Option<Duration>> {
+    let output = Command::new("afinfo")
+        // Without -r, afinfo extrapolates the duration of a file lacking a
+        // packet table, like raw AAC or VBR MP3, from its first packets.
+        .arg("-r")
+        .arg(audio)
+        .output()
+        .with_context(|| format!("cannot run afinfo on {}", audio.display()))?;
+    if !output.status.success() {
+        bail!(
+            "afinfo failed on {}: {}",
+            audio.display(),
+            first_chars(300, &output.stderr)
+        );
+    }
+    let duration = afinfo_duration(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| anyhow!("afinfo reported no duration for {}", audio.display()))?;
+    Ok((duration > MAX_DURATION).then_some(duration))
 }
 
 /// Transcribe one audio file after conversion to model-native 16 kHz mono WAV.
@@ -892,27 +937,42 @@ fn compact_error(error: &anyhow::Error) -> String {
         .join(" ")
 }
 
-fn step_file(env: &Env, scan: &BTreeMap<PathBuf, Identity>, failures: &mut Failures, audio: &Path) {
+fn step_file(env: &Env, scan: &BTreeMap<PathBuf, Identity>, verdicts: &mut Verdicts, audio: &Path) {
     let Some(identity) = scan.get(audio).copied() else {
         return;
     };
-    if matches!(
-        failures.get(audio),
-        Some((failed_identity, attempts))
-            if *failed_identity == identity && *attempts >= MAX_ATTEMPTS
-    ) {
-        return;
-    }
+    let attempts = match verdicts.get(audio) {
+        Some((seen, verdict)) if *seen == identity => match verdict {
+            Verdict::TooLong => return,
+            Verdict::Failed(attempts) if *attempts >= MAX_ATTEMPTS => return,
+            Verdict::Failed(attempts) => *attempts,
+        },
+        _ => 0,
+    };
 
-    match process_file(env, audio, &identity) {
+    let result = match too_long(audio) {
+        Ok(Some(duration)) => {
+            // Rounded up, so a recording just past the limit never reads as within it.
+            let seconds = duration.as_secs_f64().ceil() as u64;
+            log_msg(&format!(
+                "leaving {} in place untranscribed: it runs {}:{:02}, over the {}-minute limit",
+                audio.display(),
+                seconds / 60,
+                seconds % 60,
+                MAX_DURATION.as_secs() / 60
+            ));
+            verdicts.insert(audio.to_owned(), (identity, Verdict::TooLong));
+            return;
+        }
+        Ok(None) => process_file(env, audio, &identity),
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => {
-            failures.remove(audio);
+            verdicts.remove(audio);
         }
         Err(error) => {
-            let attempts = match failures.get(audio) {
-                Some((failed_identity, attempts)) if *failed_identity == identity => attempts + 1,
-                _ => 1,
-            };
+            let attempts = attempts + 1;
             log_msg(&format!(
                 "ERROR processing {}: {}",
                 audio.display(),
@@ -924,12 +984,12 @@ fn step_file(env: &Env, scan: &BTreeMap<PathBuf, Identity>, failures: &mut Failu
                     audio.display()
                 ));
             }
-            failures.insert(audio.to_owned(), (identity, attempts));
+            verdicts.insert(audio.to_owned(), (identity, Verdict::Failed(attempts)));
         }
     }
 }
 
-fn sweep(env: &Env, failures: &mut Failures) {
+fn sweep(env: &Env, verdicts: &mut Verdicts) {
     let watch_dir = env
         .opts
         .watch_dir
@@ -941,10 +1001,10 @@ fn sweep(env: &Env, failures: &mut Failures) {
     }
     let after = scan_audio(watch_dir);
     for audio in ready_files(&before, &after) {
-        step_file(env, &after, failures, &audio);
+        step_file(env, &after, verdicts, &audio);
     }
     prune_empty_dirs(watch_dir, PRUNE_MIN_IDLE);
-    failures.retain(|path, _| after.contains_key(path));
+    verdicts.retain(|path, _| after.contains_key(path));
 }
 
 fn state_dir() -> Result<PathBuf> {
@@ -1092,9 +1152,9 @@ pub fn run(mut options: Options) -> Result<()> {
         )
     ));
 
-    let mut failures = BTreeMap::new();
+    let mut verdicts = BTreeMap::new();
     if env.opts.once {
-        sweep(&env, &mut failures);
+        sweep(&env, &mut verdicts);
         return Ok(());
     }
 
@@ -1115,7 +1175,7 @@ pub fn run(mut options: Options) -> Result<()> {
     };
     let poll = Duration::from_secs(env.opts.poll_secs.max(1) as u64);
     loop {
-        sweep(&env, &mut failures);
+        sweep(&env, &mut verdicts);
         wait_for_kick(&receiver, poll, watcher.is_some());
     }
 }
@@ -1176,5 +1236,258 @@ mod tests {
                     archived.display()
                 ))
         );
+    }
+
+    /// 8 kHz 8-bit mono `samples` as a WAV file.
+    fn write_wav(path: &Path, samples: &[u8]) {
+        let rate = 8_000_u32;
+        let size = u32::try_from(samples.len()).unwrap();
+        let wav = [
+            &b"RIFF"[..],
+            &(36 + size).to_le_bytes(),
+            b"WAVEfmt \x10\0\0\0\x01\0\x01\0", // 16-byte PCM mono format chunk
+            &rate.to_le_bytes(),
+            &rate.to_le_bytes(), // bytes per second
+            b"\x01\0\x08\0data", // 1-byte frames of 8 bits
+            &size.to_le_bytes(),
+            samples,
+        ]
+        .concat();
+        fs::write(path, wav).unwrap();
+    }
+
+    /// `length` of silence as 8 kHz unsigned 8-bit samples.
+    fn silence(length: Duration) -> Vec<u8> {
+        // Unsigned 8-bit samples are silent at their midpoint.
+        vec![0x80; length.as_millis() as usize * 8]
+    }
+
+    /// `length` of silence as a WAV file.
+    fn write_silence(path: &Path, length: Duration) {
+        write_wav(path, &silence(length));
+    }
+
+    /// Whether macOS's afinfo or afconvert is missing, as on Linux or in a Nix
+    /// build whose PATH omits /usr/bin; tests needing them then pass without
+    /// running.
+    fn without_audio_tools() -> bool {
+        let missing = ["afinfo", "afconvert"]
+            .iter()
+            .any(|tool| Command::new(tool).arg("-h").output().is_err());
+        if missing {
+            eprintln!("afinfo or afconvert is not on PATH; skipping");
+        }
+        missing
+    }
+
+    /// A monitor of `dir/watch` keeping its transcripts, archive and state in
+    /// `dir`; its transcriber, if it ever runs, creates `dir/transcribed`.
+    fn monitor(dir: &Path) -> Env {
+        let watch = dir.join("watch");
+        fs::create_dir(&watch).unwrap();
+        Env {
+            opts: Options {
+                watch_dir: Some(watch),
+                audio_files: Vec::new(),
+                output_dir: Some(dir.to_owned()),
+                archive_dir: Some(dir.to_owned()),
+                prompt_file: dir.join("prompt.md"),
+                transcriber: Transcriber::AsrShell(format!(
+                    "touch {}",
+                    dir.join("transcribed").display()
+                )),
+                llm_url: "http://127.0.0.1:9".to_owned(),
+                llm_model: "model".to_owned(),
+                api_key: "key".to_owned(),
+                language: "en".to_owned(),
+                poll_secs: 30,
+                once: true,
+            },
+            state_dir: dir.to_owned(),
+            home: None,
+            client: Client::new(),
+        }
+    }
+
+    #[test]
+    fn too_long_draws_the_line_just_past_ten_minutes() {
+        if without_audio_tools() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let at_limit = dir.path().join("at-limit.wav");
+        let past_limit = dir.path().join("past-limit.wav");
+        write_silence(&at_limit, Duration::from_secs(600));
+        // Half a second past ten minutes is still past them.
+        write_silence(&past_limit, Duration::from_millis(600_500));
+
+        assert_eq!(too_long(&at_limit).unwrap(), None);
+        assert_eq!(
+            too_long(&past_limit).unwrap(),
+            Some(Duration::from_millis(600_500))
+        );
+    }
+
+    #[test]
+    fn too_long_counts_raw_aac_instead_of_guessing_from_a_quiet_opening() {
+        if without_audio_tools() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("memo.wav");
+        let aac = dir.path().join("memo.aac");
+        // A minute that opens with two seconds of silence, then noise. Raw AAC
+        // has no packet table, and judged by its quiet first packets alone,
+        // this reads as over twenty minutes.
+        let mut state = 1_u32;
+        let noise = (0..58 * 8_000).map(|_| {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (state >> 16) as u8
+        });
+        let mut samples = silence(Duration::from_secs(2));
+        samples.extend(noise);
+        write_wav(&wav, &samples);
+        let converted = Command::new("afconvert")
+            .args(["-f", "adts", "-d", "aac"])
+            .arg(&wav)
+            .arg(&aac)
+            .status()
+            .unwrap();
+        assert!(converted.success());
+
+        assert_eq!(too_long(&aac).unwrap(), None);
+    }
+
+    #[test]
+    fn too_long_fails_rather_than_pass_audio_it_cannot_measure() {
+        if without_audio_tools() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("memo.m4a");
+        fs::write(&audio, "not audio").unwrap();
+
+        assert!(too_long(&audio).is_err());
+    }
+
+    #[test]
+    fn monitor_transcribes_a_recording_of_exactly_ten_minutes() {
+        if without_audio_tools() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let env = monitor(dir.path());
+        let watch = dir.path().join("watch");
+        let audio = watch.join("memo.wav");
+        write_silence(&audio, Duration::from_secs(600));
+
+        step_file(&env, &scan_audio(&watch), &mut Verdicts::new(), &audio);
+
+        // The transcriber ran, though its empty transcript then failed the run.
+        assert!(dir.path().join("transcribed").is_file());
+    }
+
+    #[test]
+    fn monitor_leaves_a_recording_past_the_limit_in_place_untranscribed() {
+        if without_audio_tools() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let env = monitor(dir.path());
+        let watch = dir.path().join("watch");
+        let audio = watch.join("memo.wav");
+        write_silence(&audio, MAX_DURATION + Duration::from_secs(1));
+        let mut verdicts = Verdicts::new();
+
+        step_file(&env, &scan_audio(&watch), &mut verdicts, &audio);
+
+        assert!(matches!(verdicts[&audio], (_, Verdict::TooLong)));
+        assert!(audio.is_file());
+        // No transcript, archived audio, spool, or transcriber run beside it.
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["watch"]);
+    }
+
+    #[test]
+    fn monitor_measures_a_long_recording_again_only_once_it_changes() {
+        if without_audio_tools() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let env = monitor(dir.path());
+        let watch = dir.path().join("watch");
+        let audio = watch.join("memo.wav");
+        write_silence(&audio, MAX_DURATION + Duration::from_secs(1));
+        let mut verdicts = Verdicts::new();
+        step_file(&env, &scan_audio(&watch), &mut verdicts, &audio);
+
+        // Same size and mtime, so the same identity, but no longer audio:
+        // measuring it again would fail and record a failure instead.
+        let metadata = fs::metadata(&audio).unwrap();
+        fs::write(&audio, vec![0; metadata.len() as usize]).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap()
+            .set_modified(metadata.modified().unwrap())
+            .unwrap();
+        step_file(&env, &scan_audio(&watch), &mut verdicts, &audio);
+        assert!(matches!(verdicts[&audio], (_, Verdict::TooLong)));
+
+        // A changed file is measured afresh.
+        write_silence(&audio, MAX_DURATION + Duration::from_secs(2));
+        let scan = scan_audio(&watch);
+        step_file(&env, &scan, &mut verdicts, &audio);
+        assert!(matches!(
+            verdicts[&audio],
+            (identity, Verdict::TooLong) if identity == scan[&audio]
+        ));
+    }
+
+    #[test]
+    fn monitor_retries_audio_it_cannot_measure_then_gives_up_until_it_changes() {
+        if without_audio_tools() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let env = monitor(dir.path());
+        let watch = dir.path().join("watch");
+        let audio = watch.join("memo.m4a");
+        fs::write(&audio, "not audio").unwrap();
+        let scan = scan_audio(&watch);
+        let mut verdicts = Verdicts::new();
+
+        for attempt in 1..=5 {
+            step_file(&env, &scan, &mut verdicts, &audio);
+            assert!(matches!(verdicts[&audio], (_, Verdict::Failed(n)) if n == attempt));
+        }
+        // Abandoned, so a further sweep makes no attempt.
+        step_file(&env, &scan, &mut verdicts, &audio);
+        assert!(matches!(verdicts[&audio], (_, Verdict::Failed(5))));
+        assert!(audio.is_file());
+
+        // A changed file starts over.
+        fs::write(&audio, "still not audio").unwrap();
+        step_file(&env, &scan_audio(&watch), &mut verdicts, &audio);
+        assert!(matches!(verdicts[&audio], (_, Verdict::Failed(1))));
+    }
+
+    #[test]
+    fn processing_a_named_recording_ignores_the_limit() {
+        if without_audio_tools() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = monitor(dir.path());
+        env.opts.watch_dir = None;
+        let audio = dir.path().join("watch").join("memo.wav");
+        write_silence(&audio, MAX_DURATION + Duration::from_secs(1));
+
+        // The transcriber ran, though its empty transcript then failed the run.
+        assert!(process_file(&env, &audio, &file_identity(&audio).unwrap()).is_err());
+        assert!(dir.path().join("transcribed").is_file());
     }
 }

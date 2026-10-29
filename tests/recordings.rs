@@ -163,6 +163,37 @@ fn decode_chat_fails_on_empty_choices() {
 }
 
 #[test]
+fn afinfo_duration_reads_estimated_duration_line() {
+    // `afinfo -r`'s report on an eleven-minute AAC recording, abridged.
+    let output = "\
+File:           memo.m4a
+File type ID:   m4af
+Num Tracks:     1
+----
+Data format:     1 ch,  16000 Hz, aac  (0x00000000) 0 bits/channel, 0 bytes/packet, 1024 frames/packet, 0 bytes/frame
+                no channel layout.
+audio bytes: 41260
+audio packets: 10315
+estimated duration: 660.000 sec
+bit rate: 500 bits per second
+";
+    assert_eq!(afinfo_duration(output), Some(Duration::from_secs(660)));
+    // Fractions of a second survive.
+    assert_eq!(
+        afinfo_duration("estimated duration: 600.500 sec\n"),
+        Some(Duration::from_millis(600_500))
+    );
+}
+
+#[test]
+fn afinfo_duration_fails_on_missing_or_impossible_duration() {
+    // What afinfo prints to stdout for a file it cannot open.
+    assert_eq!(afinfo_duration("File:           memo.m4a\n"), None);
+    assert_eq!(afinfo_duration("estimated duration: nan sec\n"), None);
+    assert_eq!(afinfo_duration("estimated duration: -1.000000 sec\n"), None);
+}
+
+#[test]
 fn durable_write_is_atomic_and_leaves_no_temp_file() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("out.txt");

@@ -69,6 +69,12 @@ recordings ~/Recordings \
   ```
 - `SSL_CERT_FILE`, when set, is CA bundle used to validate TLS endpoints.
   `--api-key` (default `dummy-key`) is sent as Bearer token.
+- In watch mode, a recording longer than 10 minutes (as macOS `afinfo`
+  measures it) stays in place untranscribed, since Cohere transcribes long
+  audio poorly. It is logged once, then ignored until file changes or daemon
+  restarts. Naming it on the command line transcribes it anyway, but only
+  with the daemon stopped, as one instance at a time holds the state
+  directory.
 - A recording that keeps failing is retried on later sweeps and abandoned after
   5 attempts until file changes or daemon restarts; audio stays put on failure.
 - Empty subdirectories of watch tree (including `.DS_Store`-only ones) are
