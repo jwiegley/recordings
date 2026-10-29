@@ -1,0 +1,149 @@
+#+TITLE: Obr Issues
+#+SEQ_TODO: TODO DOING DRAFT WAIT DEFER NOTE | DONE CANCELED
+#+ISSUE_PREFIX: record
+
+* TODO [#C] Switch launchd service to --asr-url once omlx transcribes cohere correctly
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       record-2ov
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-09-01 Tue 00:40]
+:MODIFIED: [2026-09-01 Tue 00:40]
+:CREATED_BY: johnw
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+Replace --asr-command mlx-speech with --asr-url https://hera.lan:8443/v1 --asr-model cohere-transcribe-03-2026-mlx-fp16 and export SSL_CERT_FILE=recordingCaBundle in launchd.nix. The daemon's HTTP path is already built and TLS-verified (UnknownCa and NameMismatch both rejected in testing).
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "record-2ov",
+    "depends_on_id": "record-a84",
+    "type": "blocks",
+    "created_at": "2026-09-01T07:40:02.318178Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* DOING [#C] Cut over launchd service; retire transcribe and flatten-recordings scripts
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       record-3tf
+:LABELS:   []
+:ISSUE_TYPE: chore
+:CREATED:  [2026-09-01 Tue 00:40]
+:MODIFIED: [2026-09-01 Tue 11:57]
+:CREATED_BY: johnw
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+Adopt the new launchd.nix block (README Deployment section) in ~/src/nix, rebuild, verify a real recording end to end, then delete transcribe and flatten-recordings from ~/src/scripts.
+
+* TODO [#C] Report omlx cohere-transcribe STT garbling upstream
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       record-a84
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-09-01 Tue 00:40]
+:MODIFIED: [2026-09-01 Tue 00:40]
+:CREATED_BY: johnw
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+omlx 0.6.4 /v1/audio/transcriptions returns multilingual garbage for cohere-transcribe-03-2026-mlx-fp16 (verified direct on localhost:8000, input-format independent; in-process mlx-speech transcribes the same audio correctly). omlx dispatches STT into mlx_audio generically; mlx_audio 0.4.3 has cohere_asr, so likely a feature-extraction or model-asset mismatch. Also: the omlx server env lacks ffmpeg, so it rejects m4a uploads (this daemon sidesteps by uploading 16 kHz WAV).
+
+* TODO [#D] Decide fate of agent-note dispatch hooks
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       record-ct9
+:LABELS:   []
+:ISSUE_TYPE: question
+:CREATED:  [2026-09-01 Tue 00:40]
+:MODIFIED: [2026-09-01 Tue 12:01]
+:CREATED_BY: johnw
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+The old flatten-recordings called dispatch-agent-note enqueue/drain after publishing each transcript. Not carried into the rewrite (not in the six requirements). If still wanted, a post-publish hook command flag would be the minimal addition. NOTE 2026-09-01: dispatch-agent-note itself shells out to the transcribe script (AGENT_NOTE_TRANSCRIBE default, ~/src/scripts/dispatch-agent-note:200,607) and reads ~/.config/transcribe/llm-route.json — the staged deletion of transcribe leaves it broken until this is resolved (port its LLM call or retire it).
+
+* TODO [#D] Confirm org importer handles new transcript naming
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       record-q5r
+:LABELS:   []
+:ISSUE_TYPE: question
+:CREATED:  [2026-09-01 Tue 00:40]
+:MODIFIED: [2026-09-01 Tue 00:40]
+:CREATED_BY: johnw
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+Transcripts are now published as name.txt rather than name.m4a.txt, and the org receipt-dir mechanism is gone. Verify the Org inbox importer that consumes ~/Recordings/*.txt still matches.
+
+* DONE [#C] Fix nix develop: x86_64-darwin eval throw and clobbered IOG cache
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       record-r2g
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-09-01 Tue 09:58]
+:MODIFIED: [2026-09-01 Tue 09:58]
+:CREATED_BY: johnw
+:FINISHED: [2026-09-01 Tue 09:58]
+:CLOSE_REASON: Both causes fixed and verified; devShell plan builds only project deps
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+Two stacked causes. (A) eachDefaultSystem enumerates x86_64-darwin, which nixpkgs 26.11 dropped with an import-time throw; fixed by eachSystem [aarch64-darwin x86_64-linux aarch64-linux]. (B) ~/.config/nix/nix.conf used bare 'substituters =' / 'trusted-public-keys =' lines, which replace the accumulated system config and wiped the cache.iog.io haskell.nix cache already correctly configured in /etc/nix/nix.custom.conf; fixed by switching the user file to extra-substituters/extra-trusted-public-keys (backup at ~/.config/nix/nix.conf.bak). Verified: nix config show lists cache.iog.io; devShell dry-run has zero ghc/bootstrap drvs, floating or pinned. flake.lock additionally pins haskellNix to pushme's rev a695b259 for store reuse.
+
+* TODO [#C] Notice recordings that never arrive
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       record-y89
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-09-07 Mon 21:01]
+:MODIFIED: [2026-09-07 Mon 21:01]
+:CREATED_BY: johnw
+:SOURCE_REPO: recordings
+:SOURCE_REPO_PATH: /Users/johnw/src/sys/recordings
+:ORIGINAL_SIZE: 0
+:END:
+
+The daemon only ever sees what lands in the watch tree, and nothing reconciles that against what the recording device actually captured. When a file never syncs, or its destination is removed mid-upload, the gap is silent: no log line, no alert, and the loss surfaces only when someone goes looking for a transcript that was never made.
+
+Discovered while diagnosing a recording missing from 2026-09-06: exactly one of two deliberately-recorded sessions reached the Mac, and the absence left no trace anywhere in the pipeline.
+
+Worth considering: log a per-sweep count, or track the last-seen sequence per date directory, so a hole is visible without a manual audit.
+
+* DONE [#B] Trigger sweeps from native filesystem events (FSEvents/inotify)
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       record-zff
+:LABELS:   []
+:ISSUE_TYPE: feature
+:CREATED:  [2026-09-01 Tue 00:40]
+:MODIFIED: [2026-09-01 Tue 00:45]
+:CREATED_BY: johnw
+:FINISHED: [2026-09-01 Tue 00:45]
+:CLOSE_REASON: Implemented via fsnotify (FSEvents on macOS, inotify on Linux): events kick the sweep MVar, poll interval remains as fallback. Verified live: with --poll 3600, transcription began 2s after a file appeared in a newly created subdirectory.
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+Use fsnotify (FSEvents on macOS, inotify on Linux) to kick a sweep the moment the watch tree changes, instead of waiting out the poll interval. Events are a wake-up signal only; the poll sweep remains the correctness backbone and fallback.
+
