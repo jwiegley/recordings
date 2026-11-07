@@ -48,6 +48,21 @@ Replace --asr-command mlx-speech with --asr-url https://hera.lan:8443/v1 --asr-m
 
 Adopt the new launchd.nix block (README Deployment section) in ~/src/nix, rebuild, verify a real recording end to end, then delete transcribe and flatten-recordings from ~/src/scripts.
 
+* DONE [#B] Never publish an LLM refusal as a transcript
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       record-7w9
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-07 Sat 08:49]
+:MODIFIED: [2026-11-07 Sat 08:49]
+:CREATED_BY: johnw
+:FINISHED: [2026-11-07 Sat 08:49]
+:CLOSE_REASON: On 2026-11-07 a 4.4 s voice memo, "Remind Sano that he should also get a good recording app.", reached John's Org inbox as the cleanup model's refusal ("I cannot fulfill this request as I do not have access to external communication channels or the ability to send messages to individuals."). Cause: the raw transcript was the bare user turn, so a dictated reminder read as a request to the model, and the reply was published unchecked. Measured against Qwen3.8-27B-oQ4e-fp16-mtp on omlx-hera with the daemon's settings: the bare form gave a refusal 5 of 15 times, the framed form 0 of 15. Fix: the transcript travels inside <transcript> tags under an instruction naming it as dictation, and cleanup_rejection refuses any reply with a refusal phrase the speaker did not say, under 75% of its words following the speaker's in order, or under 50% of the speaker's words kept; the raw transcript is then published with a WARN line. Tests: an end-to-end process_file test replays the exact refusal through a fake endpoint and requires the speaker's words in the published note; a faithful cleanup is still published; unit tests cover framing, tag unwrapping, accepted cleanups and rejected refusals, answers and summaries.
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
 * TODO [#C] Report omlx cohere-transcribe STT garbling upstream
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17

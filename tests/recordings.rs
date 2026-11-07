@@ -106,6 +106,72 @@ fn join_url_ignores_trailing_slash() {
 }
 
 #[test]
+fn cleanup_request_frames_the_transcript_as_dictation() {
+    let said = "Remind Sano that he should also get a good recording app.";
+    let request = chat_request_value("m", "rules", said);
+    assert_eq!(request["messages"][0]["content"], "rules");
+    let user = request["messages"][1]["content"].as_str().unwrap();
+    assert!(user.contains("not a request to you"), "{user}");
+    assert!(
+        user.ends_with(&format!("<transcript>\n{said}\n</transcript>")),
+        "{user}"
+    );
+}
+
+#[test]
+fn unwrap_cleanup_drops_echoed_tags_and_spaces() {
+    assert_eq!(
+        unwrap_cleanup("<transcript>\nHello.\n</transcript>\n"),
+        "Hello."
+    );
+    assert_eq!(unwrap_cleanup("  Hello.  "), "Hello.");
+}
+
+#[test]
+fn faithful_cleanups_are_accepted() {
+    for (raw, cleaned) in [
+        (
+            "Remind Sano that he should also get a good recording app.",
+            "Remind Sano that he should also get a good recording app.",
+        ),
+        (
+            "um so I think uh we should we should ship it period",
+            "So I think we should ship it.",
+        ),
+        ("I love see plus plus and rust", "I love C++ and Rust."),
+        (
+            "I cannot believe it, um, works",
+            "I cannot believe it works.",
+        ),
+    ] {
+        assert_eq!(cleanup_rejection(raw, cleaned), None, "{cleaned}");
+    }
+}
+
+#[test]
+fn answers_refusals_and_summaries_are_rejected() {
+    let refusal = "I cannot fulfill this request as I do not have access to external \
+                   communication channels or the ability to send messages to individuals.";
+    for (raw, cleaned) in [
+        (
+            "Remind Sano that he should also get a good recording app.",
+            refusal,
+        ),
+        (
+            "What is the capital of France?",
+            "The capital of France is Paris.",
+        ),
+        (
+            "we met with the vendor today and talked through the pricing the support \
+             terms the migration plan and the timeline for the first release",
+            "Vendor meeting about pricing.",
+        ),
+    ] {
+        assert!(cleanup_rejection(raw, cleaned).is_some(), "{cleaned}");
+    }
+}
+
+#[test]
 fn max_tokens_clamps_between_2048_and_32768() {
     assert_eq!(max_tokens_for("short"), 2_048);
     assert_eq!(max_tokens_for(&"x".repeat(100_000)), 32_768);
@@ -132,7 +198,7 @@ fn chat_request_carries_prompt_as_system_and_transcript_as_user() {
             .unwrap();
     assert!(body.contains("\"system\""));
     assert!(body.contains("\"fix it\""));
-    assert!(body.contains("\"raw words\""));
+    assert!(body.contains("<transcript>\\nraw words\\n</transcript>"));
 }
 
 #[test]

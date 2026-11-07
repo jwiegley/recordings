@@ -51,8 +51,14 @@ recordings ~/Recordings \
   `/audio/transcriptions` endpoint (`--asr-url`/`--asr-model`) or a local
   command whose stdout is transcript and receives WAV path last:
   `--asr-command "mlx-speech asr --model <model-dir> --language en --audio"`.
-- Cleanup posts raw transcript with prompt file contents as system message to
-  `/chat/completions` (`--llm-url`, `--llm-model`).
+- Cleanup posts prompt file contents as system message to `/chat/completions`
+  (`--llm-url`, `--llm-model`), and the raw transcript inside `<transcript>`
+  tags, named as dictation rather than a request, as user message. A reply that
+  is not a cleanup of what was said is never published: when it contains a
+  refusal phrase the speaker did not say, when under three quarters of its
+  words follow the speaker's in order, or when it keeps under half of them, the
+  raw transcript is published instead and a `WARN cleanup ... rejected` line
+  is logged.
 - Each transcript opens with an Org property drawer recording its source: a
   `file:` link to the audio where it ends up (the archive when `--archive` is
   given, `~/...` when under `$HOME`) and the first 256 bits of the audio's
