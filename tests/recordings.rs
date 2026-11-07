@@ -119,56 +119,223 @@ fn cleanup_request_frames_the_transcript_as_dictation() {
 }
 
 #[test]
-fn unwrap_cleanup_drops_echoed_tags_and_spaces() {
+fn unwrap_cleanup_keeps_only_the_last_tagged_span() {
     assert_eq!(
         unwrap_cleanup("<transcript>\nHello.\n</transcript>\n"),
         "Hello."
     );
     assert_eq!(unwrap_cleanup("  Hello.  "), "Hello.");
+    assert_eq!(unwrap_cleanup("<Transcript>Hello.</TRANSCRIPT>"), "Hello.");
+    assert_eq!(
+        unwrap_cleanup("Hello.</transcript>\nLet me know if you need more."),
+        "Hello."
+    );
+    // A model that echoes the request keeps only the transcript's span.
+    let request = chat_request_value("m", "rules", "Hello.");
+    let echoed = format!(
+        "{}\n<transcript>\nHello again.\n</transcript>",
+        request["messages"][1]["content"].as_str().unwrap()
+    );
+    assert_eq!(unwrap_cleanup(&echoed), "Hello again.");
 }
 
 #[test]
+fn prompt_placeholders_left_unfilled_are_reported() {
+    let dir = tempdir().unwrap();
+    let prompt = dir.path().join("prompt.md");
+    assert!(
+        prompt_file_problem(&prompt).is_some_and(|problem| problem.contains("missing")),
+        "a missing prompt"
+    );
+    fs::write(&prompt, "Clean it.\n\nTranscript:\n${output}\n").unwrap();
+    assert!(
+        prompt_file_problem(&prompt).is_some_and(|problem| problem.contains("${output}")),
+        "an unfilled placeholder"
+    );
+    fs::write(&prompt, "Clean it.\n").unwrap();
+    assert_eq!(prompt_file_problem(&prompt), None);
+}
+
+/// Cleanups by the rules of the deployed prompt, each of which must stand.
+const FAITHFUL_CLEANUPS: &[(&str, &str)] = &[
+    (
+        "Remind Sano that he should also get a good recording app.",
+        "Remind Sano that he should also get a good recording app.",
+    ),
+    (
+        "um so I think uh we should we should ship it period",
+        "So I think we should ship it.",
+    ),
+    ("Call Bob at five thirty", "Call Bob at 5:30."),
+    (
+        "Meeting at three thirty pm tomorrow",
+        "Meeting at 3:30 PM tomorrow.",
+    ),
+    ("Gate code is four two seven one", "Gate code is 4271."),
+    (
+        "Call Sano at four one five five five five one two three four",
+        "Call Sano at 4155551234.",
+    ),
+    (
+        "Pay the rent of twenty four hundred dollars",
+        "Pay the rent of $2,400.",
+    ),
+    (
+        "Try Qwen three point five on the M four max",
+        "Try Qwen 3.5 on the M4 Max.",
+    ),
+    (
+        "Upgrade to python three point twelve",
+        "Upgrade to Python 3.12.",
+    ),
+    (
+        "The M three ultra has five hundred twelve gigabytes of unified memory and eight \
+         hundred gigabytes per second of bandwidth",
+        "The M3 Ultra has 512 GB of unified memory and 800 GB per second of bandwidth.",
+    ),
+    (
+        "Connect to one twenty seven dot zero dot zero dot one",
+        "Connect to 127.0.0.1.",
+    ),
+    (
+        "call foo underscore bar open paren x comma y close paren semicolon",
+        "call foo_bar(x, y);",
+    ),
+    (
+        "x equals foo open paren bar comma baz close paren",
+        "x = foo(bar, baz)",
+    ),
+    (
+        "use std double colon collections double colon hash map semicolon",
+        "use std::collections::HashMap;",
+    ),
+    (
+        "I tried pie torch and tensor flow on the M three max with llama see PP and V LLM",
+        "I tried PyTorch and TensorFlow on the M3 Max with llama.cpp and vLLM.",
+    ),
+    (
+        "I love see plus plus and pie torch",
+        "I love C++ and PyTorch.",
+    ),
+    (
+        "I want to, I need to, actually let me, let's just go with the second option",
+        "Let's just go with the second option.",
+    ),
+    (
+        "I, um, can't make the meeting tomorrow",
+        "I can't make the meeting tomorrow.",
+    ),
+    (
+        "Tell her I'm, uh, sorry I missed the call",
+        "Tell her I'm sorry I missed the call.",
+    ),
+    (
+        "Im sorry I missed your call",
+        "I'm sorry I missed your call.",
+    ),
+    (
+        "We dont have access to the staging server",
+        "We don't have access to the staging server.",
+    ),
+    (
+        "The UI can not scroll past the fold",
+        "The UI cannot scroll past the fold.",
+    ),
+    (
+        "The A.P.I. can't handle that many requests",
+        "The API can't handle that many requests.",
+    ),
+    (
+        "As an A.I. engineer I care about latency",
+        "As an AI engineer, I care about latency.",
+    ),
+    ("the API, uh, can't handle it", "The API can't handle it."),
+    (
+        "and then I\ncannot reproduce the crash",
+        "And then I cannot reproduce the crash.",
+    ),
+    ("I can not believe it works", "I cannot believe it works."),
+    ("I'll call you when I land", "I'll call you when I land."),
+    ("Note to self: buy milk", "Note to self: buy milk."),
+    ("我们明天开会讨论预算", "我们明天开会，讨论预算。"),
+    ("Fifteen", "15"),
+];
+
+#[test]
 fn faithful_cleanups_are_accepted() {
-    for (raw, cleaned) in [
-        (
-            "Remind Sano that he should also get a good recording app.",
-            "Remind Sano that he should also get a good recording app.",
-        ),
-        (
-            "um so I think uh we should we should ship it period",
-            "So I think we should ship it.",
-        ),
-        ("I love see plus plus and rust", "I love C++ and Rust."),
-        (
-            "I cannot believe it, um, works",
-            "I cannot believe it works.",
-        ),
-    ] {
+    for (raw, cleaned) in FAITHFUL_CLEANUPS {
         assert_eq!(cleanup_rejection(raw, cleaned), None, "{cleaned}");
     }
 }
 
 #[test]
-fn answers_refusals_and_summaries_are_rejected() {
-    let refusal = "I cannot fulfill this request as I do not have access to external \
-                   communication channels or the ability to send messages to individuals.";
-    for (raw, cleaned) in [
+fn refusals_answers_commentary_and_summaries_are_rejected() {
+    let sano = "Remind Sano that he should also get a good recording app.";
+    let plan = "So the plan for tomorrow is to finish the migration of the build cache, \
+                then look at why the nightly job keeps timing out on the larger runners";
+    for (raw, cleaned, reason) in [
+        // The reply published on 2026-11-07.
         (
-            "Remind Sano that he should also get a good recording app.",
-            refusal,
+            sano,
+            "I cannot fulfill this request as I do not have access to external communication \
+             channels or the ability to send messages to individuals.",
+            "\"i cannot\"",
+        ),
+        // A refusal that repeats the memo passes both shares.
+        (
+            "Remind Sano that he should also get a good recording app",
+            "I'm sorry, but I can't remind Sano that he should also get a good recording app.",
+            "\"i cant\"",
+        ),
+        (sano, &format!("Reminder set: {sano}"), "\"reminder set\""),
+        (
+            plan,
+            &format!("Here is the cleaned transcript: {plan}."),
+            "\"here is\"",
         ),
         (
-            "What is the capital of France?",
-            "The capital of France is Paris.",
+            plan,
+            &format!("{plan}.\n\nNote: I removed the filler words."),
+            "\"note\"",
         ),
         (
-            "we met with the vendor today and talked through the pricing the support \
-             terms the migration plan and the timeline for the first release",
+            plan,
+            &format!("{plan}. (Sorry, but sending reminders is not something I'm able to do.)"),
+            "\"not something im able\"",
+        ),
+        // An answer that uses none of those phrases.
+        (
+            "What's the weather tomorrow",
+            "Tomorrow will be sunny with a high of 72 degrees.",
+            "were spoken",
+        ),
+        // A summary built only from the speaker's words.
+        (
+            "we met with the vendor today and talked through the pricing the support terms \
+             the migration plan and the timeline for the first release",
             "Vendor meeting about pricing.",
+            "speaker's words",
         ),
     ] {
-        assert!(cleanup_rejection(raw, cleaned).is_some(), "{cleaned}");
+        let rejection = cleanup_rejection(raw, cleaned);
+        assert!(
+            rejection.as_deref().is_some_and(|why| why.contains(reason)),
+            "{cleaned}: {rejection:?}"
+        );
     }
+}
+
+#[test]
+fn a_completion_cut_short_is_recognized() {
+    assert!(chat_hit_length_limit(
+        br#"{"choices":[{"message":{"content":"Remind"},"finish_reason":"length"}]}"#
+    ));
+    assert!(!chat_hit_length_limit(
+        br#"{"choices":[{"message":{"content":"Remind."},"finish_reason":"stop"}]}"#
+    ));
+    assert!(!chat_hit_length_limit(
+        br#"{"choices":[{"message":{"content":"Remind."}}]}"#
+    ));
 }
 
 #[test]

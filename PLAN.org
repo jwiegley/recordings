@@ -55,13 +55,27 @@ Adopt the new launchd.nix block (README Deployment section) in ~/src/nix, rebuil
 :LABELS:   []
 :ISSUE_TYPE: bug
 :CREATED:  [2026-11-07 Sat 08:49]
-:MODIFIED: [2026-11-07 Sat 08:49]
+:MODIFIED: [2026-11-07 Sat 09:27]
 :CREATED_BY: johnw
 :FINISHED: [2026-11-07 Sat 08:49]
 :CLOSE_REASON: On 2026-11-07 a 4.4 s voice memo, "Remind Sano that he should also get a good recording app.", reached John's Org inbox as the cleanup model's refusal ("I cannot fulfill this request as I do not have access to external communication channels or the ability to send messages to individuals."). Cause: the raw transcript was the bare user turn, so a dictated reminder read as a request to the model, and the reply was published unchecked. Measured against Qwen3.8-27B-oQ4e-fp16-mtp on omlx-hera with the daemon's settings: the bare form gave a refusal 5 of 15 times, the framed form 0 of 15. Fix: the transcript travels inside <transcript> tags under an instruction naming it as dictation, and cleanup_rejection refuses any reply with a refusal phrase the speaker did not say, under 75% of its words following the speaker's in order, or under 50% of the speaker's words kept; the raw transcript is then published with a WARN line. Tests: an end-to-end process_file test replays the exact refusal through a fake endpoint and requires the speaker's words in the published note; a faithful cleanup is still published; unit tests cover framing, tag unwrapping, accepted cleanups and rejected refusals, answers and summaries.
 :SOURCE_REPO: .
 :ORIGINAL_SIZE: 0
 :END:
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 1,
+    "issue_id": "record-7w9",
+    "author": "johnw",
+    "text": "Root cause revised, and the guard rebuilt after review (same day, before any push).\n\nCause: ~/doc/post-process.md ended in \"Transcript:\\n${output}\", the old pipeline's template slot, which this daemon sends unfilled as the system message. The model read the transcript as missing and the memo as a request. Measured on the live endpoint, 15 runs per arm: as deployed, 5 refusals; with the placeholder removed, 0; with the <transcript> framing, 0; with both, 0. John's prompt file no longer has the placeholder, and prompt_file_problem logs a WARN at startup for a prompt that does.\n\nGuard: an independent review found that the first guard's ordered-word ratios rejected correct cleanups of numbers, code and vocabulary corrections (4 of 12 live cleanups), and that its substring phrase match tripped on filler removal and contractions (\"I, um, can't\" -> \"I can't\"). It now compares normalized words (apostrophes dropped, fillers removed, \"can not\" and spelled-out letters joined) and rejects a reply that (1) was cut short at its token limit, (2) adds a phrase a model uses about itself, the request or its edits, (3) has under 40% of its content words spoken, or (4) keeps under 40% of the speaker's content words; spoken numbers, units and punctuation count on neither side. Only the reply's last <transcript> span counts. All 32 cleanups in the fixture table pass. Of the review's 12 non-cleanups, 5 are rejected and 2 are recovered from the echoed span; \"Sure!\" prefixes, appended answers, summaries made of the speaker's words and an unflagged truncation still pass, as the README says. Each rule and normalization step is held by a test: 13 mutants caught, with the control passing in the same layout.\n",
+    "created_at": "2026-11-07T17:27:30Z"
+  }
+]
+#+end_src
 
 * TODO [#C] Report omlx cohere-transcribe STT garbling upstream
 :PROPERTIES:

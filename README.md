@@ -53,12 +53,19 @@ recordings ~/Recordings \
   `--asr-command "mlx-speech asr --model <model-dir> --language en --audio"`.
 - Cleanup posts prompt file contents as system message to `/chat/completions`
   (`--llm-url`, `--llm-model`), and the raw transcript inside `<transcript>`
-  tags, named as dictation rather than a request, as user message. A reply that
-  is not a cleanup of what was said is never published: when it contains a
-  refusal phrase the speaker did not say, when under three quarters of its
-  words follow the speaker's in order, or when it keeps under half of them, the
-  raw transcript is published instead and a `WARN cleanup ... rejected` line
-  is logged.
+  tags, named as dictation rather than a request, as user message. The prompt
+  must not keep the old pipeline's `${output}` placeholder: left unfilled, it
+  reads as a missing transcript and turns a memo into a request, so a prompt
+  with one is logged as a `WARN` at startup.
+- When a reply echoes the tags, only its last tagged span counts. The raw
+  transcript is published in place of a reply, with a `WARN cleanup ...
+  rejected` line, when the reply was cut short at its token limit; when it
+  says something a model says about itself, the request or its edits ("I
+  cannot", "I'm sorry", "here is", "note", ...) that the speaker did not; when
+  under 40% of its words were spoken; or when it keeps under 40% of the
+  speaker's words. Numbers, units, spoken punctuation and fillers count on
+  neither side. That catches refusals, answers and commentary, but not a short
+  addition such as "Sure!" or a summary made of the speaker's own words.
 - Each transcript opens with an Org property drawer recording its source: a
   `file:` link to the audio where it ends up (the archive when `--archive` is
   given, `~/...` when under `$HOME`) and the first 256 bits of the audio's
