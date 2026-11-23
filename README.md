@@ -81,7 +81,7 @@ recordings ~/Recordings \
   Cleaned transcript text...
   ```
 - `SSL_CERT_FILE`, when set, is CA bundle used to validate TLS endpoints.
-  `--api-key` (default `dummy-key`) is sent as Bearer token.
+  `--api-key` (default `dummy-key`) is sent as Bearer token. `--api-key-file FILE` reads it from a file instead, which must be readable only by its owner (mode 600) and keeps the key out of the process list; the two options exclude each other.
 - In watch mode, a recording longer than 10 minutes (as macOS `afinfo`
   measures it) stays in place untranscribed, since Cohere transcribes long
   audio poorly. It is logged once, then ignored until file changes or daemon

@@ -129,6 +129,11 @@ struct Cli {
     #[arg(long, value_name = "KEY", default_value = "dummy-key")]
     api_key: String,
 
+    /// File holding the bearer token, so it stays out of the command line.
+    /// Must not be readable by group or others; surrounding whitespace is ignored.
+    #[arg(long, value_name = "FILE", conflicts_with = "api_key")]
+    api_key_file: Option<PathBuf>,
+
     /// ISO 639-1 language for transcription.
     #[arg(long, value_name = "CODE", default_value = "en")]
     language: String,
@@ -150,6 +155,13 @@ impl Options {
             (None, None, Some(command)) => Transcriber::AsrShell(command),
             _ => unreachable!("transcriber arguments are validated by clap"),
         };
+        let api_key = match &cli.api_key_file {
+            Some(path) => read_api_key_file(path).unwrap_or_else(|error| {
+                eprintln!("error: --api-key-file {}: {error:#}", path.display());
+                std::process::exit(2);
+            }),
+            None => cli.api_key,
+        };
         let watch_dir =
             (cli.paths.len() == 1 && cli.paths[0].is_dir()).then(|| cli.paths[0].clone());
         let audio_files = if watch_dir.is_some() {
@@ -166,12 +178,41 @@ impl Options {
             transcriber,
             llm_url: cli.llm_url,
             llm_model: cli.llm_model,
-            api_key: cli.api_key,
+            api_key,
             language: cli.language,
             poll_secs: cli.poll,
             once: cli.once,
         }
     }
+}
+
+/// Read a bearer token from `path`: one value, whitespace trimmed, never empty.
+/// On Unix the file must not be accessible to group or others, so a key that
+/// was kept off the command line is not left world-readable instead.
+fn read_api_key_file(path: &Path) -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)
+            .with_context(|| "cannot read the key file")?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            bail!(
+                "mode {:o} lets group or others read it; use chmod 600",
+                mode & 0o777
+            );
+        }
+    }
+    let key = fs::read_to_string(path).with_context(|| "cannot read the key file")?;
+    let key = key.trim();
+    if key.is_empty() {
+        bail!("the key file is empty");
+    }
+    if key.contains(char::is_whitespace) {
+        bail!("the key file holds more than one value");
+    }
+    Ok(key.to_owned())
 }
 
 /// Whether a filename has a supported audio extension and is not hidden.
@@ -1668,6 +1709,58 @@ mod tests {
             home: None,
             client: Client::new(),
         }
+    }
+
+    #[cfg(unix)]
+    fn key_file(dir: &Path, contents: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("key");
+        fs::write(&path, contents).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_key_file_gives_the_trimmed_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = key_file(dir.path(), "  secret-token\n", 0o600);
+        assert_eq!(read_api_key_file(&path).unwrap(), "secret-token");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_key_file_refuses_a_key_others_can_read() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o640, 0o604, 0o644] {
+            let path = key_file(dir.path(), "secret-token\n", mode);
+            let error = read_api_key_file(&path).unwrap_err().to_string();
+            assert!(error.contains("chmod 600"), "{mode:o}: {error}");
+            assert!(!error.contains("secret-token"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_key_file_refuses_an_empty_or_multi_value_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = key_file(dir.path(), " \n", 0o600);
+        assert!(
+            read_api_key_file(&empty)
+                .unwrap_err()
+                .to_string()
+                .contains("empty")
+        );
+        let two = key_file(dir.path(), "one two\n", 0o600);
+        let error = read_api_key_file(&two).unwrap_err().to_string();
+        assert!(error.contains("more than one value"));
+        assert!(!error.contains("one two"));
+    }
+
+    #[test]
+    fn api_key_file_reports_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_api_key_file(&dir.path().join("absent")).is_err());
     }
 
     #[test]
